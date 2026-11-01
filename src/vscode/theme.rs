@@ -10,7 +10,7 @@ use syntect::highlighting::{
     Color, ScopeSelectors, StyleModifier, Theme, ThemeItem, ThemeSettings,
 };
 
-use super::{Extensions, find, parse_color, parse_color32, read_jsonc};
+use super::{parse_color, parse_color32, read_jsonc};
 
 /// A VS Code colour theme, ready for syntect and the window.
 pub struct EditorTheme {
@@ -31,10 +31,15 @@ impl EditorTheme {
     }
 }
 
-pub fn load(extensions: &Extensions, name: &str) -> Option<EditorTheme> {
-    let found = find(&extensions.color_themes, name)?;
-    let ui_dark = !matches!(found.ui_theme.as_deref(), Some("vs" | "hc-light"));
-    let (colors, rules, kind) = read_theme(&found.path, 0)?;
+/// Whether a theme is dark by its extension's `uiTheme`.
+pub fn ui_dark(ui_theme: Option<&str>) -> bool {
+    !matches!(ui_theme, Some("vs" | "hc-light"))
+}
+
+/// Reads the theme `name` from its file; `ui_dark` is what its extension says it is, in case
+/// the file doesn't say.
+pub fn load_file(name: &str, path: &Path, ui_dark: bool) -> Option<EditorTheme> {
+    let (colors, rules, kind) = read_theme(path, 0)?;
     let dark = match kind.as_deref() {
         Some("light" | "hcLight") => false,
         Some(_) => true,
@@ -167,7 +172,11 @@ mod tests {
                  "tokenColors": [ { "scope": ["keyword", "storage"], "settings": { "foreground": "#ff6188" } }, ] }"##,
         );
         let extensions = super::super::scan(std::slice::from_ref(&dir));
-        let theme = load(&extensions, "Nice Dark");
+        let found = super::super::color_themes_in(&extensions);
+        let theme = found
+            .first()
+            .and_then(|t| load_file(&t.name, &t.path, t.dark));
+        assert_eq!(found.first().map(|t| t.name.as_str()), Some("Nice Dark"));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(theme.is_some(), "theme not found");
         let Some(theme) = theme else { return };

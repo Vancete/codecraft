@@ -4,7 +4,7 @@
 //! `cargo run --example ui_shot -- <folder> <out-prefix> [step]...`
 //!
 //! Steps (coordinates in points, window is 1400×860):
-//! `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `drag:x1,y1,x2,y2`, `leave` (pointer off the window), `open:path` (a folder or a file), `vscode:on|off` (the VS Code theme setting), `key:Escape`, `ckey:P` (Ctrl/Cmd+key), `cskey:F` (Ctrl+Shift+key), `skey:F3` (Shift+key), `type:text`, `wait:ms`, `shot`.
+//! `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `drag:x1,y1,x2,y2`, `leave` (pointer off the window), `open:path` (a folder or a file), `key:Escape`, `ckey:P` (Ctrl/Cmd+key), `cskey:F` (Ctrl+Shift+key), `skey:F3` (Shift+key), `type:text`, `wait:ms`, `shot`.
 //! Each `shot` writes `<out-prefix>-<n>.png`.
 
 use std::time::{Duration, Instant};
@@ -84,11 +84,6 @@ fn main() {
             "open" => {
                 harness.state_mut().open_path(std::path::Path::new(arg));
                 settle(&mut harness, 600);
-            }
-            "vscode" => {
-                let ctx = harness.ctx.clone();
-                harness.state_mut().set_vscode_theme(arg == "on", &ctx);
-                settle(&mut harness, 400);
             }
             "leave" => {
                 harness.remove_cursor();

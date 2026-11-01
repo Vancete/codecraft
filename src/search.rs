@@ -25,7 +25,7 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// Bigger files aren't searched.
 const MAX_FILE: u64 = 10 << 20;
 /// Never searched (with `.git`), as VS Code's default `search.exclude`.
-const EXCLUDED: &[&str] = &["node_modules", "bower_components"];
+pub(crate) const EXCLUDED: &[&str] = &["node_modules", "bower_components"];
 /// Characters kept before a match in its line's preview.
 const LEAD: usize = 26;
 

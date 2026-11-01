@@ -23,6 +23,9 @@ struct Node {
 }
 
 pub enum Action {
+    /// A single click: in the preview tab.
+    Preview(PathBuf),
+    /// A double click: in a tab of its own.
     Open(PathBuf),
     OpenFolder,
 }
@@ -144,7 +147,6 @@ impl Explorer {
         });
 
         let rows = self.rows();
-        let arrows = !icons_theme.hides_arrows();
         egui::ScrollArea::vertical()
             .id_salt("explorer")
             .auto_shrink(false)
@@ -162,7 +164,7 @@ impl Explorer {
                     let x = rect.left() + 10.0 + *depth as f32 * INDENT;
                     let y = rect.center().y;
                     let expanded = node.is_dir && self.expanded.contains(&node.path);
-                    if node.is_dir && arrows {
+                    if node.is_dir {
                         icons::paint(
                             ui,
                             Rect::from_center_size(pos2(x + 6.0, y), vec2(14.0, 14.0)),
@@ -175,22 +177,17 @@ impl Explorer {
                             t.text_faint,
                         );
                     }
-                    let icon_x = x + if arrows { 16.0 } else { 0.0 };
+                    let icon_x = x + 16.0;
                     let icon_rect = Rect::from_min_size(
                         pos2(icon_x, y - file_icons::SIZE / 2.0),
                         vec2(file_icons::SIZE, file_icons::SIZE),
                     );
-                    let drew_icon = if node.is_dir {
-                        icons_theme.paint_folder(ui, icon_rect, &node.name, expanded)
+                    if node.is_dir {
+                        icons_theme.paint_folder(ui, icon_rect, expanded);
                     } else {
                         icons_theme.paint_file(ui, icon_rect, &node.name);
-                        true
-                    };
-                    let text_x = if drew_icon {
-                        icon_rect.right() + 6.0
-                    } else {
-                        icon_x
-                    };
+                    }
+                    let text_x = icon_rect.right() + 6.0;
                     let color = if selected { t.text } else { t.text_dim };
                     ui.painter().with_clip_rect(rect).text(
                         pos2(text_x, y),
@@ -205,8 +202,11 @@ impl Explorer {
                                 self.expanded.insert(node.path.clone());
                             }
                         } else {
-                            action = Some(Action::Open(node.path.clone()));
+                            action = Some(Action::Preview(node.path.clone()));
                         }
+                    }
+                    if resp.double_clicked() && !node.is_dir {
+                        action = Some(Action::Open(node.path.clone()));
                     }
                     resp.on_hover_text(node.path.display().to_string());
                 }

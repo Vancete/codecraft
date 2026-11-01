@@ -29,6 +29,9 @@ pub struct Document {
     /// Hash of the text as it is on disk.
     saved_hash: u64,
     pub dirty: bool,
+    /// Opened with a single click and not edited yet: the next file opened that way takes its
+    /// tab. Its name is in italics.
+    pub preview: bool,
     /// The file used CRLF line ends; the editor works with LF and saves them back.
     crlf: bool,
     /// When the file was last read or written, to notice changes made elsewhere.
@@ -74,6 +77,7 @@ impl Document {
             content: Content::Unsupported(String::new()),
             saved_hash: 0,
             dirty: false,
+            preview: false,
             crlf: false,
             modified: None,
             syntax: None,
@@ -201,6 +205,26 @@ impl Document {
             self.edited();
         }
         n
+    }
+
+    /// The text, when it can be edited here.
+    pub fn text(&self) -> Option<&str> {
+        match &self.content {
+            Content::Text(text) => Some(text),
+            Content::Unsupported(_) => None,
+        }
+    }
+
+    /// Replaces the whole text (an extension's command); false when it can't be edited here.
+    pub fn set_text(&mut self, new: String) -> bool {
+        let Content::Text(text) = &mut self.content else {
+            return false;
+        };
+        if *text != new {
+            *text = new;
+            self.edited();
+        }
+        true
     }
 
     /// The text was changed here (not typed): its matches and the dirty flag follow.

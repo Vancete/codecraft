@@ -314,8 +314,7 @@ pub fn medium(size: f32) -> FontId {
 }
 
 /// Inter and JetBrains Mono first; egui's default fonts stay last for symbols Inter lacks.
-/// `extra`: more fonts, each its own family (the glyphs of VS Code's icon theme).
-pub fn install_fonts(ctx: &egui::Context, extra: &[(String, Vec<u8>)]) {
+pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let mut add = |name: &str, bytes: &'static [u8]| {
         fonts
@@ -349,16 +348,6 @@ pub fn install_fonts(ctx: &egui::Context, extra: &[(String, Vec<u8>)]) {
         fonts
             .families
             .insert(FontFamily::Name(family.into()), stack);
-    }
-    for (family, bytes) in extra {
-        fonts.font_data.insert(
-            family.clone(),
-            Arc::new(FontData::from_owned(bytes.clone())),
-        );
-        fonts.families.insert(
-            FontFamily::Name(family.as_str().into()),
-            vec![family.clone()],
-        );
     }
     ctx.set_fonts(fonts);
 }

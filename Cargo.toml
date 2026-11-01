@@ -6,6 +6,7 @@ rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "A small, fast-starting code editor"
 publish = false
+repository = "https://github.com/Vancete/codecraft"
 readme = "README.md"
 
 [dependencies]
@@ -15,8 +16,8 @@ egui_extras = { version = "0.36", default-features = false, features = ["svg", "
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Walks the folder for the search view, skipping what .gitignore lists (ripgrep's walker).
 ignore = "0.4"
-# Inflates the WOFF fonts that font-based VS Code icon themes (Seti) ship.
-miniz_oxide = "0.8"
+# Extensions' scripts, in Luau (sandboxed: no files, no network, no processes).
+mlua = { version = "0.12.2", features = ["luau"] }
 # The terminal panel: the shell in a pseudo-terminal, its output interpreted as xterm does.
 portable-pty = "0.9"
 regex = "1"
@@ -40,6 +41,28 @@ opt-level = 2
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[package.metadata.deb]
+maintainer = "Iván <vancete07@gmail.com>"
+section = "editors"
+depends = "$auto"
+extended-description = "A small, fast-starting code editor: file tree, tabs, syntax colouring, find and replace, folder search, quick open, a built-in terminal and Luau extensions."
+assets = [
+    ["target/release/codecraft", "usr/bin/", "755"],
+    ["packaging/codecraft.desktop", "usr/share/applications/", "644"],
+    ["assets/app-icon/codecraft-256.png", "usr/share/icons/hicolor/256x256/apps/codecraft.png", "644"],
+    ["README.md", "usr/share/doc/codecraft/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/codecraft", dest = "/usr/bin/codecraft", mode = "755" },
+    { source = "packaging/codecraft.desktop", dest = "/usr/share/applications/codecraft.desktop", mode = "644" },
+    { source = "assets/app-icon/codecraft-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/codecraft.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/codecraft/README.md", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/codecraft/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/codecraft/LICENSE-APACHE", mode = "644", doc = true },
+]
 
 [build-dependencies]
 # Icon and version info for codecraft.exe; build.rs only uses it when targeting Windows.

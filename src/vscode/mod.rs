@@ -1,98 +1,81 @@
-//! What VS Code is using: its colour theme ([`theme`]) and file icon theme ([`icons`]), read
-//! from its user settings and the extensions that contribute them.
+//! VS Code's colour themes ([`theme`]), to import into CodeCraft.
 //!
-//! Finding either means scanning every extension's `package.json` (built-in ones included), so
-//! [`load`] does it once and the result is cached until VS Code's settings file changes.
+//! Listing them means scanning every extension's `package.json` (built-in ones included), so
+//! that is only done when the list is asked for, and kept. An imported theme remembers its
+//! file, so loading it later reads just that file.
 
-pub mod icons;
 pub mod theme;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use egui::Color32;
 use serde_json::Value;
 
-/// VS Code's colour and icon themes, as far as they could be found.
-#[derive(Default)]
-pub struct Loaded {
-    pub theme: Option<theme::EditorTheme>,
-    pub icons: Option<icons::IconTheme>,
+/// A colour theme installed in VS Code.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ThemeInfo {
+    pub name: String,
+    pub dark: bool,
+    /// The theme file.
+    pub path: PathBuf,
 }
 
-/// The themes selected in VS Code. Read again only when VS Code's settings file changed; an
-/// empty result when VS Code isn't installed. A call made while another is reading waits for
-/// it and shares its result.
-pub fn load() -> Arc<Loaded> {
-    type Cache = Option<(PathBuf, Option<SystemTime>, Arc<Loaded>)>;
-    static CACHE: Mutex<Cache> = Mutex::new(None);
+/// What the extensions of every installed VS Code flavour contribute, scanned once.
+fn extensions() -> Arc<Extensions> {
+    static SCANNED: Mutex<Option<Arc<Extensions>>> = Mutex::new(None);
+    let Ok(mut scanned) = SCANNED.lock() else {
+        return Arc::default();
+    };
+    Arc::clone(scanned.get_or_insert_with(|| Arc::new(scan(&extension_dirs()))))
+}
 
-    let Some(editor) = installed_editors()
-        .into_iter()
-        .find(|e| e.settings.is_file())
-    else {
-        return Arc::default();
-    };
-    let modified = std::fs::metadata(&editor.settings)
-        .and_then(|m| m.modified())
-        .ok();
-    let Ok(mut cache) = CACHE.lock() else {
-        return Arc::default();
-    };
-    if let Some((path, when, loaded)) = cache.as_ref()
-        && *path == editor.settings
-        && *when == modified
+/// The colour themes installed in VS Code, by name, each once.
+pub fn color_themes() -> Vec<ThemeInfo> {
+    color_themes_in(&extensions())
+}
+
+fn color_themes_in(extensions: &Extensions) -> Vec<ThemeInfo> {
+    let mut out: Vec<ThemeInfo> = Vec::new();
+    for c in &extensions.color_themes {
+        let Some(name) = c.label.clone().or_else(|| c.id.clone()) else {
+            continue;
+        };
+        if out.iter().all(|t| t.name != name) {
+            out.push(ThemeInfo {
+                name,
+                dark: theme::ui_dark(c.ui_theme.as_deref()),
+                path: c.path.clone(),
+            });
+        }
+    }
+    out.sort_by_key(|t| t.name.to_lowercase());
+    out
+}
+
+/// A colour theme read from its file, once and kept.
+pub fn color_theme(info: &ThemeInfo) -> Option<Arc<theme::EditorTheme>> {
+    type Cache = HashMap<PathBuf, Option<Arc<theme::EditorTheme>>>;
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+    if let Ok(cache) = CACHE.lock()
+        && let Some(found) = cache.as_ref().and_then(|c| c.get(&info.path))
     {
-        return Arc::clone(loaded);
+        return found.clone();
     }
-    let loaded = Arc::new(read(&editor));
-    *cache = Some((editor.settings.clone(), modified, Arc::clone(&loaded)));
-    loaded
-}
-
-fn read(editor: &Editor) -> Loaded {
-    let Some(settings) = read_jsonc(&editor.settings) else {
-        return Loaded::default();
-    };
-    let extensions = scan(&editor.extension_dirs);
-    let setting = |key: &str| settings.get(key).and_then(Value::as_str);
-    // VS Code's own defaults when the user never picked one.
-    let color_theme = setting("workbench.colorTheme").unwrap_or("Default Dark Modern");
-    let icon_theme = match settings.get("workbench.iconTheme") {
-        Some(Value::Null) => None,
-        Some(v) => v.as_str(),
-        None => Some("vs-seti"),
-    };
-    Loaded {
-        theme: theme::load(&extensions, color_theme),
-        icons: icon_theme.and_then(|id| icons::load(&extensions, id)),
+    let found = theme::load_file(&info.name, &info.path, info.dark).map(Arc::new);
+    if let Ok(mut cache) = CACHE.lock() {
+        cache
+            .get_or_insert_with(HashMap::new)
+            .insert(info.path.clone(), found.clone());
     }
-}
-
-/// One VS Code flavour: its user settings file and where its extensions live.
-struct Editor {
-    settings: PathBuf,
-    extension_dirs: Vec<PathBuf>,
+    found
 }
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-}
-
-fn config_dir() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
-        home().map(|h| h.join("Library/Application Support"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home().map(|h| h.join(".config")))
-    }
 }
 
 /// Folders a VS Code install keeps its built-in extensions in.
@@ -110,16 +93,16 @@ fn builtin_dirs(install: &Path) -> Vec<PathBuf> {
     dirs.into_iter().filter(|d| d.is_dir()).collect()
 }
 
-fn installed_editors() -> Vec<Editor> {
-    let (Some(config), Some(home)) = (config_dir(), home()) else {
+/// Where VS Code, VS Code Insiders and VSCodium keep their extensions, user and built-in.
+fn extension_dirs() -> Vec<PathBuf> {
+    let Some(home) = home() else {
         return Vec::new();
     };
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
-    // (settings folder, user extensions folder, install folder names)
-    let flavours: [(&str, &str, &[&str]); 3] = [
+    // (user extensions folder, install folder names)
+    let flavours: [(&str, &[&str]); 3] = [
         (
-            "Code",
             ".vscode",
             &[
                 "Microsoft VS Code",
@@ -129,7 +112,6 @@ fn installed_editors() -> Vec<Editor> {
             ],
         ),
         (
-            "Code - Insiders",
             ".vscode-insiders",
             &[
                 "Microsoft VS Code Insiders",
@@ -138,7 +120,6 @@ fn installed_editors() -> Vec<Editor> {
             ],
         ),
         (
-            "VSCodium",
             ".vscode-oss",
             &[
                 "VSCodium",
@@ -159,28 +140,25 @@ fn installed_editors() -> Vec<Editor> {
 
     flavours
         .iter()
-        .map(|(settings, extensions, installs)| {
-            let mut extension_dirs = vec![home.join(extensions).join("extensions")];
+        .flat_map(|(extensions, installs)| {
+            let mut dirs = vec![home.join(extensions).join("extensions")];
             for root in &roots {
                 for name in *installs {
-                    extension_dirs.extend(builtin_dirs(&root.join(name)));
+                    dirs.extend(builtin_dirs(&root.join(name)));
                 }
             }
-            Editor {
-                settings: config.join(settings).join("User/settings.json"),
-                extension_dirs,
-            }
+            dirs
         })
         .collect()
 }
 
-/// A theme an extension contributes (colour or icon).
+/// A colour theme an extension contributes.
 pub struct Contribution {
     pub id: Option<String>,
     pub label: Option<String>,
     /// The theme file, absolute.
     pub path: PathBuf,
-    /// `uiTheme` of a colour theme (`vs`, `vs-dark`, `hc-black`, `hc-light`).
+    /// `uiTheme` (`vs`, `vs-dark`, `hc-black`, `hc-light`).
     pub ui_theme: Option<String>,
 }
 
@@ -188,11 +166,6 @@ pub struct Contribution {
 #[derive(Default)]
 pub struct Extensions {
     pub color_themes: Vec<Contribution>,
-    pub icon_themes: Vec<Contribution>,
-    /// Lower-case extension without the dot (`rs`, `d.ts`) → language id.
-    pub language_by_extension: HashMap<String, String>,
-    /// Lower-case file name (`makefile`) → language id.
-    pub language_by_name: HashMap<String, String>,
 }
 
 fn scan(dirs: &[PathBuf]) -> Extensions {
@@ -243,45 +216,9 @@ fn scan(dirs: &[PathBuf]) -> Extensions {
                     .collect()
             };
             out.color_themes.extend(contributions("themes"));
-            out.icon_themes.extend(contributions("iconThemes"));
-            for lang in contributes
-                .get("languages")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let Some(id) = lang.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let strings = |key: &str| {
-                    lang.get(key)
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_lowercase)
-                };
-                for e in strings("extensions") {
-                    let e = e.trim_start_matches('.').to_owned();
-                    out.language_by_extension
-                        .entry(e)
-                        .or_insert_with(|| id.to_owned());
-                }
-                for name in strings("filenames") {
-                    out.language_by_name
-                        .entry(name)
-                        .or_insert_with(|| id.to_owned());
-                }
-            }
         }
     }
     out
-}
-
-/// Finds the contribution called `name` (its id or label).
-fn find<'a>(list: &'a [Contribution], name: &str) -> Option<&'a Contribution> {
-    list.iter()
-        .find(|c| c.id.as_deref() == Some(name) || c.label.as_deref() == Some(name))
 }
 
 /// `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`, as straight (unmultiplied) RGBA.

@@ -1,96 +1,28 @@
-//! The icon next to a file or folder (explorer rows, editor tabs): from VS Code's file icon
-//! theme when that setting is on and the theme was found, otherwise a built-in Lucide icon
-//! coloured by file type.
+//! The icon next to a file or folder (explorer rows, editor tabs): a Lucide icon coloured by
+//! file type.
 
-use std::sync::Arc;
-
-use egui::{Color32, FontFamily, FontId, Rect, Ui, Vec2};
+use egui::{Color32, Rect, Ui};
 
 use crate::icons;
 use crate::theme::Tokens;
-use crate::vscode::icons::{IconDef, IconTheme};
 
 /// Size icons are drawn at.
 pub const SIZE: f32 = 16.0;
 
 #[derive(Clone, Default)]
-pub struct FileIcons {
-    theme: Option<Arc<crate::vscode::Loaded>>,
-}
+pub struct FileIcons;
 
 impl FileIcons {
-    /// Icons from `loaded`'s icon theme, or the built-in ones without it.
-    pub fn new(loaded: Option<Arc<crate::vscode::Loaded>>) -> Self {
-        Self {
-            theme: loaded.filter(|l| l.icons.is_some()),
-        }
-    }
-
-    fn theme(&self) -> Option<&IconTheme> {
-        self.theme.as_ref().and_then(|l| l.icons.as_ref())
-    }
-
-    /// The theme hides the chevrons of folders (it draws open and closed folders instead).
-    pub fn hides_arrows(&self) -> bool {
-        self.theme().is_some_and(|t| t.hides_arrows)
-    }
-
     pub fn paint_file(&self, ui: &Ui, rect: Rect, name: &str) {
         let t = Tokens::get(ui.ctx());
-        if let Some(theme) = self.theme()
-            && let Some(def) = theme.file(name, !t.dark())
-        {
-            paint_def(ui, theme, rect, def, t.icon);
-            return;
-        }
         let (icon, color) = builtin(name, &t);
         icons::paint(ui, rect, icon, SIZE - 2.0, color);
     }
 
-    /// Returns false when the theme draws no folders, so the caller can draw its own.
-    pub fn paint_folder(&self, ui: &Ui, rect: Rect, name: &str, expanded: bool) -> bool {
+    pub fn paint_folder(&self, ui: &Ui, rect: Rect, expanded: bool) {
         let t = Tokens::get(ui.ctx());
-        let Some(theme) = self.theme() else {
-            let icon = if expanded { "folder-open" } else { "folder" };
-            icons::paint(ui, rect, icon, SIZE - 2.0, t.text_faint);
-            return true;
-        };
-        match theme.folder(name, expanded, !t.dark()) {
-            Some(def) => {
-                paint_def(ui, theme, rect, def, t.icon);
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-fn paint_def(ui: &Ui, theme: &IconTheme, rect: Rect, def: &IconDef, fallback: Color32) {
-    let rect = Rect::from_center_size(rect.center(), Vec2::splat(SIZE));
-    match def {
-        IconDef::Glyph {
-            family,
-            ch,
-            color,
-            scale,
-        } => {
-            let font = FontId::new(12.0 * scale, FontFamily::Name(family.as_str().into()));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                ch,
-                font,
-                color.unwrap_or(fallback),
-            );
-        }
-        IconDef::Image(path) => {
-            if let Some(bytes) = theme.image_bytes(path) {
-                let uri = format!("bytes://vscode-icons/{}", path.display());
-                egui::Image::from_bytes(uri, bytes)
-                    .fit_to_exact_size(Vec2::splat(SIZE))
-                    .paint_at(ui, rect);
-            }
-        }
+        let icon = if expanded { "folder-open" } else { "folder" };
+        icons::paint(ui, rect, icon, SIZE - 2.0, t.text_faint);
     }
 }
 

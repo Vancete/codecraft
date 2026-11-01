@@ -18,6 +18,7 @@ macro_rules! icons {
 const SOURCES: &[(&str, &str)] = icons![
     "arrow-down",
     "arrow-up",
+    "blocks",
     "book-open",
     "case-sensitive",
     "chevron-down",

@@ -3,9 +3,17 @@
 
 use std::sync::atomic::Ordering;
 
-use codecraft::app;
+use codecraft::{app, single_instance};
 
 fn main() -> eframe::Result {
+    let open_arg = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    // A file opened while CodeCraft runs goes to a tab of that window.
+    if let Some(path) = open_arg.as_deref()
+        && path.is_file()
+        && single_instance::forward(path)
+    {
+        return Ok(());
+    }
     app::preload();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -14,6 +22,7 @@ fn main() -> eframe::Result {
             .with_app_id("codecraft")
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([800.0, 500.0])
+            .with_drag_and_drop(true)
             .with_icon(app::window_icon()),
         // Runs after eframe restored the last session's size and position.
         window_builder: Some(Box::new(|builder| {
@@ -30,8 +39,9 @@ fn main() -> eframe::Result {
         "codecraft",
         options,
         Box::new(|cc| {
-            let open_arg = std::env::args_os().nth(1).map(std::path::PathBuf::from);
-            Ok(Box::new(app::App::new(cc, open_arg)))
+            let mut app = app::App::new(cc, open_arg);
+            app.take_files_from(single_instance::listen(cc.egui_ctx.clone()));
+            Ok(Box::new(app))
         }),
     )
 }

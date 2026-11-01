@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::editor::{self, Document};
 use crate::explorer::{self, Explorer};
+use crate::extensions::{self, Extensions};
 use crate::file_icons::{self, FileIcons};
 use crate::find::FindBar;
 use crate::highlight;
 use crate::icons;
+use crate::quick_open::{self, QuickOpen};
 use crate::search::{self, SearchView};
-use crate::settings::{Settings, VsCodeStatus};
+use crate::settings::{CodeTheme, Settings};
 use crate::terminal::{self, ShellSpec, Terminal};
 use crate::theme::{self, ThemeKind, Tokens};
 use crate::vscode;
@@ -33,9 +35,6 @@ pub static MAXIMIZE_WHEN_SHOWN: AtomicBool = AtomicBool::new(false);
 /// Starts reading VS Code's themes on a background thread, to overlap with the window's
 /// creation; `App::new` then finds them cached instead of scanning VS Code's extensions.
 pub fn preload() {
-    std::thread::spawn(|| {
-        vscode::load();
-    });
     highlight::warm_up();
 }
 
@@ -65,6 +64,7 @@ enum SideView {
     #[default]
     Explorer,
     Search,
+    Extensions,
 }
 
 /// Something waiting on "save your changes?".
@@ -105,7 +105,27 @@ impl Tab {
     fn dirty(&self) -> bool {
         self.doc().is_some_and(|d| d.dirty)
     }
+
+    /// Stays the same while the tab moves along the strip.
+    fn id(&self) -> egui::Id {
+        match self {
+            Tab::Doc(doc) => egui::Id::new(("tab", &doc.path)),
+            Tab::Settings => egui::Id::new("tab-settings"),
+        }
+    }
 }
+
+/// A tab being dragged along the strip.
+#[derive(Clone, Copy)]
+struct TabDrag {
+    /// Its index when the drag started.
+    from: usize,
+    /// Where the pointer holds it, from its left edge.
+    grab: f32,
+}
+
+/// Seconds tabs take to slide into their place.
+const TAB_SLIDE: f32 = 0.15;
 
 pub struct App {
     explorer: Explorer,
@@ -124,8 +144,14 @@ pub struct App {
     terminal_error: Option<String>,
     /// Files whose search matches wait on "replace them all?".
     confirm_replace: Option<Vec<PathBuf>>,
+    tab_drag: Option<TabDrag>,
+    quick_open: QuickOpen,
+    extensions: Extensions,
+    /// Files other instances were asked to open (see `single_instance`).
+    incoming: Option<std::sync::mpsc::Receiver<PathBuf>>,
     /// VS Code's themes, when the setting is on.
-    vscode: Option<Arc<vscode::Loaded>>,
+    /// The VS Code colour theme in use, when one is chosen and found.
+    code_theme: Option<Arc<vscode::theme::EditorTheme>>,
     file_icons: FileIcons,
     /// A short note in the status bar: (text, is an error, until).
     note: Option<(String, bool, Instant)>,
@@ -146,6 +172,7 @@ impl App {
         egui_extras::install_image_loaders(ctx);
         saved.settings.set(ctx);
 
+        let extensions = Extensions::load(&saved.settings.enabled_extensions);
         let mut app = Self {
             explorer: Explorer::default(),
             tabs: Vec::new(),
@@ -162,14 +189,19 @@ impl App {
             terminal_open: false,
             terminal_error: None,
             confirm_replace: None,
-            vscode: None,
-            file_icons: FileIcons::default(),
+            tab_drag: None,
+            quick_open: QuickOpen::default(),
+            extensions,
+            incoming: None,
+            code_theme: None,
+            file_icons: FileIcons,
             note: None,
             closing: None,
             close_confirmed: false,
             was_focused: true,
         };
-        app.apply_theme(ctx, true);
+        theme::install_fonts(ctx);
+        app.apply_theme(ctx);
 
         if let Some(folder) = saved.folder.filter(|f| f.is_dir()) {
             app.explorer.set_root(Some(folder));
@@ -187,6 +219,60 @@ impl App {
             app.open_path(&path);
         }
         app
+    }
+
+    /// Opens the files other instances hand over, as they arrive.
+    pub fn take_files_from(&mut self, incoming: Option<std::sync::mpsc::Receiver<PathBuf>>) {
+        self.incoming = incoming;
+    }
+
+    /// Files dropped on the window, or handed over by another instance: each in a tab of its
+    /// own (a folder opens in the explorer). Shows "Drop to open" while files are dragged over.
+    fn open_arriving(&mut self, ctx: &egui::Context) {
+        let mut paths: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_owned())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        let handed: Vec<PathBuf> = self
+            .incoming
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        if !handed.is_empty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        paths.extend(handed);
+        for path in paths {
+            self.open_path(&path);
+        }
+
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let t = Tokens::get(ctx);
+            let screen = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop-files"),
+            ));
+            painter.rect_filled(screen, 0.0, t.shadow);
+            painter.rect_stroke(
+                screen.shrink(6.0),
+                t.radius,
+                Stroke::new(2.0, t.accent),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop to open",
+                theme::semibold(20.0),
+                t.text,
+            );
+        }
     }
 
     /// Opens a folder in the explorer, or a file in a tab (its folder too, if none is open).
@@ -208,12 +294,6 @@ impl App {
         }
     }
 
-    /// Turns the VS Code theme setting on or off (for `examples/ui_shot.rs`).
-    pub fn set_vscode_theme(&mut self, on: bool, ctx: &egui::Context) {
-        self.settings.vscode_theme = on;
-        self.apply_theme(ctx, false);
-    }
-
     fn open_folder(&mut self, path: &Path) {
         self.explorer.set_root(Some(path.to_owned()));
         self.recent.retain(|p| p != path);
@@ -231,22 +311,112 @@ impl App {
         }
     }
 
+    /// Opens a file in a tab of its own (or pins its preview tab).
     fn open_file(&mut self, path: &Path) {
+        self.open_file_as(path, false);
+    }
+
+    /// Opens a file; `preview` puts it in the preview tab, replacing the file shown there,
+    /// unless preview tabs are turned off.
+    fn open_file_as(&mut self, path: &Path, preview: bool) {
+        let preview = preview && self.settings.preview_tabs;
         match self
             .tabs
             .iter()
             .position(|t| t.doc().is_some_and(|d| d.path == path))
         {
-            Some(i) => self.active = i,
+            Some(i) => {
+                self.active = i;
+                if !preview && let Some(doc) = self.tabs.get_mut(i).and_then(Tab::doc_mut) {
+                    doc.preview = false;
+                }
+            }
             None => {
-                self.tabs.push(Tab::Doc(Box::new(Document::open(path))));
-                self.active = self.tabs.len() - 1;
+                let mut doc = Box::new(Document::open(path));
+                doc.preview = preview;
+                let reuse = preview
+                    .then(|| {
+                        self.tabs
+                            .iter()
+                            .position(|t| t.doc().is_some_and(|d| d.preview && !d.dirty))
+                    })
+                    .flatten();
+                match reuse.and_then(|i| self.tabs.get_mut(i).map(|t| (i, t))) {
+                    Some((i, tab)) => {
+                        *tab = Tab::Doc(doc);
+                        self.active = i;
+                    }
+                    None => {
+                        self.tabs.push(Tab::Doc(doc));
+                        self.active = self.tabs.len() - 1;
+                    }
+                }
             }
         }
         if let Some(doc) = self.tabs.get_mut(self.active).and_then(Tab::doc_mut) {
             doc.focus = true;
         }
         self.explorer.selected = Some(path.to_owned());
+    }
+
+    /// The command palette's commands: those of the enabled extensions.
+    fn commands(&self) -> Vec<quick_open::Command> {
+        self.extensions.commands()
+    }
+
+    /// Runs a command from the command palette on the open file.
+    fn run_command(&mut self, id: &str) {
+        let Some(doc) = self.active_doc() else {
+            self.show_note("Open a file first".to_owned(), true);
+            return;
+        };
+        let Some(text) = doc.text() else {
+            self.show_note(format!("{} can't be edited here", doc.name), true);
+            return;
+        };
+        let input = extensions::Doc {
+            text: text.to_owned(),
+            name: doc.name.clone(),
+            path: doc.path.clone(),
+        };
+        match self.extensions.run(id, &input) {
+            Ok(outcome) => {
+                if let Some(text) = outcome.text
+                    && let Some(doc) = self.active_doc_mut()
+                {
+                    doc.set_text(text);
+                    doc.focus = true;
+                }
+                if let Some(note) = outcome.notes.into_iter().last() {
+                    self.show_note(note, false);
+                }
+            }
+            Err(e) => self.show_note(e, true),
+        }
+    }
+
+    fn extension_action(&mut self, action: extensions::Action) {
+        let enabled = &mut self.settings.enabled_extensions;
+        match action {
+            extensions::Action::Enable(id) => {
+                self.extensions.set_enabled(&id, true);
+                if !enabled.contains(&id) {
+                    enabled.push(id);
+                }
+            }
+            extensions::Action::Disable(id) => {
+                self.extensions.set_enabled(&id, false);
+                enabled.retain(|e| *e != id);
+            }
+            extensions::Action::Rescan => self.extensions.rescan(enabled),
+            extensions::Action::OpenFolder => {
+                let dir = Extensions::dir();
+                let opened = std::fs::create_dir_all(&dir).and_then(|()| reveal(&dir));
+                if let Err(e) = opened {
+                    self.show_note(format!("{}: {e}", dir.display()), true);
+                }
+            }
+        }
     }
 
     /// Shows the settings tab, opening it after the others if it isn't open.
@@ -557,70 +727,129 @@ impl App {
         self.note = Some((text, error, Instant::now() + Duration::from_secs(secs)));
     }
 
-    /// Picks the theme: VS Code's when that setting is on and its theme was found, otherwise
-    /// CodeCraft's own. `force` re-installs the fonts even if VS Code's themes didn't change.
-    fn apply_theme(&mut self, ctx: &egui::Context, force: bool) {
-        let loaded = self.settings.vscode_theme.then(vscode::load);
-        let changed = match (&loaded, &self.vscode) {
-            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-            (None, None) => false,
-            _ => true,
-        };
-        let tokens = match loaded.as_ref().and_then(|l| l.theme.as_ref()) {
+    /// Applies the theme chosen: a VS Code one colours the whole window, CodeCraft's own leave
+    /// it in the light or dark look picked.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        self.code_theme = self.settings.vscode_theme().and_then(vscode::color_theme);
+        let tokens = match &self.code_theme {
             Some(vs) => Tokens::with_vscode(vs),
             None => Tokens::for_kind(self.theme),
         };
         theme::apply(ctx, tokens);
-        if changed || force {
-            let fonts = loaded
-                .as_ref()
-                .and_then(|l| l.icons.as_ref())
-                .map(|i| i.fonts.as_slice())
-                .unwrap_or_default();
-            theme::install_fonts(ctx, fonts);
-            self.file_icons = FileIcons::new(loaded.clone());
-        }
-        self.vscode = loaded;
     }
 
     fn set_theme(&mut self, ctx: &egui::Context, kind: ThemeKind) {
         self.theme = kind;
-        self.apply_theme(ctx, false);
-    }
-
-    fn vscode_status(&self) -> VsCodeStatus {
-        let loaded = vscode::load();
-        VsCodeStatus {
-            color_theme: loaded.theme.as_ref().map(|t| t.name.clone()),
-            icon_theme: loaded.icons.as_ref().map(|i| i.name.clone()),
-        }
+        self.apply_theme(ctx);
     }
 
     /// Editor tabs on a dark strip (gitcraft's repository tabs), the window's buttons at the end.
+    /// A tab can be dragged along the strip, the others sliding out of its way, as in Opera.
     fn tab_strip(&mut self, ui: &mut Ui) {
         let t = Tokens::get(ui.ctx());
         let mut select = None;
         let mut close = None;
         let mut open_settings = false;
+        let mut moved = None;
+        let mut pin = None;
         ui.horizontal(|ui| {
             ui.set_min_height(TAB_H);
             ui.spacing_mut().item_spacing.x = 1.0;
-            for (i, tab) in self.tabs.iter().enumerate() {
+            const GAP: f32 = 1.0;
+            let ctx = ui.ctx().clone();
+            let n = self.tabs.len();
+            // Each tab's title and width.
+            let titles: Vec<_> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, tab)| {
+                    let active = i == self.active;
+                    let font = if active {
+                        theme::medium(12.5)
+                    } else {
+                        egui::FontId::proportional(12.5)
+                    };
+                    let color = if active { t.text } else { t.text_dim };
+                    let mut job = egui::text::LayoutJob::simple_singleline(
+                        tab.name().to_owned(),
+                        font,
+                        color,
+                    );
+                    if let Some(section) = job.sections.first_mut() {
+                        section.format.italics = tab.doc().is_some_and(|d| d.preview);
+                    }
+                    let galley = ui.painter().layout_job(job);
+                    let w = (galley.size().x + 66.0).clamp(110.0, 260.0);
+                    (galley, color, w)
+                })
+                .collect();
+            let width = |i: usize| titles.get(i).map_or(0.0, |g| g.2);
+            let total: f32 = titles.iter().map(|g| g.2 + GAP).sum();
+            let (strip, _) = ui.allocate_exact_size(vec2(total, TAB_H), Sense::hover());
+
+            // The dragged tab follows the pointer; the slot it would drop into is where its
+            // middle is among the others.
+            let dragged = self.tab_drag.filter(|d| d.from < n).and_then(|d| {
+                let x = ctx.pointer_interact_pos()?.x - d.grab;
+                let max = (strip.right() - width(d.from) - GAP).max(strip.left());
+                Some((d.from, x.clamp(strip.left(), max)))
+            });
+            let mut order: Vec<usize> = (0..n).collect();
+            if let Some((from, x)) = dragged {
+                let middle = x + width(from) / 2.0;
+                let mut left = strip.left();
+                let mut slot = 0;
+                for j in (0..n).filter(|&j| j != from) {
+                    if left + width(j) / 2.0 < middle {
+                        slot += 1;
+                    }
+                    left += width(j) + GAP;
+                }
+                order.retain(|&j| j != from);
+                order.insert(slot, from);
+                if !ctx.input(|i| i.pointer.primary_down()) {
+                    moved = Some((from, slot));
+                }
+            }
+            let mut place = vec![strip.left(); n];
+            let mut x = strip.left();
+            for &j in &order {
+                if let Some(p) = place.get_mut(j) {
+                    *p = x;
+                }
+                x += width(j) + GAP;
+            }
+
+            // The dragged tab is drawn last, over the others.
+            let dragging = dragged.map(|(from, _)| from);
+            let paint_order = (0..n).filter(|&j| Some(j) != dragging).chain(dragging);
+            for i in paint_order {
+                let (Some(tab), Some((galley, color, w))) = (self.tabs.get(i), titles.get(i))
+                else {
+                    continue;
+                };
+                let (galley, color, w) = (galley.clone(), *color, *w);
                 let active = i == self.active;
                 let dirty = tab.dirty();
-                let font = if active {
-                    theme::medium(12.5)
-                } else {
-                    egui::FontId::proportional(12.5)
+                let id = tab.id();
+                let x = match dragged {
+                    Some((from, x)) if from == i => {
+                        ctx.animate_value_with_time(id.with("x"), x, 0.0)
+                    }
+                    _ => ctx.animate_value_with_time(
+                        id.with("x"),
+                        place.get(i).copied().unwrap_or(strip.left()),
+                        TAB_SLIDE,
+                    ),
                 };
-                let color = if active { t.text } else { t.text_dim };
-                let galley = ui
-                    .painter()
-                    .layout_no_wrap(tab.name().to_owned(), font, color);
-                let w = (galley.size().x + 66.0).clamp(110.0, 260.0);
-                let (rect, resp) = ui.allocate_exact_size(vec2(w, TAB_H), Sense::click());
-                let hovered = resp.hovered();
+                let rect = Rect::from_min_size(pos2(x, strip.top()), vec2(w, TAB_H));
+                let resp = ui.interact(rect, id, Sense::click_and_drag());
+                let hovered = resp.hovered() && dragging.is_none();
                 let p = ui.painter();
+                if dragging == Some(i) {
+                    p.rect_filled(rect, 0.0, if active { t.tab_active } else { t.hover });
+                }
                 if active {
                     p.rect_filled(rect, 0.0, t.tab_active);
                     p.line_segment(
@@ -677,18 +906,35 @@ impl App {
                 if c.clicked() {
                     close = Some(i);
                 }
-                c.on_hover_text("Close (Ctrl+W)");
-                let tip = match tab {
-                    Tab::Doc(doc) => doc.path.display().to_string(),
-                    Tab::Settings => "Settings".to_owned(),
-                };
-                let resp = resp.on_hover_text(tip);
+                if resp.drag_started_by(egui::PointerButton::Primary)
+                    && let Some(origin) = ctx.input(|i| i.pointer.press_origin())
+                {
+                    self.tab_drag = Some(TabDrag {
+                        from: i,
+                        grab: origin.x - rect.left(),
+                    });
+                    select = Some(i);
+                }
+                if dragging.is_none() {
+                    c.on_hover_text("Close (Ctrl+W)");
+                    let tip = match tab {
+                        Tab::Doc(doc) => doc.path.display().to_string(),
+                        Tab::Settings => "Settings".to_owned(),
+                    };
+                    resp.clone().on_hover_text(tip);
+                }
                 if resp.clicked() && close.is_none() {
                     select = Some(i);
                 }
                 if resp.middle_clicked() {
                     close = Some(i);
                 }
+                if resp.double_clicked() {
+                    pin = Some(i);
+                }
+            }
+            if !ctx.input(|i| i.pointer.primary_down()) {
+                self.tab_drag = None;
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -706,11 +952,7 @@ impl App {
                                 .font(theme::semibold(10.5))
                                 .color(t.text_faint),
                         );
-                        let following = self
-                            .vscode
-                            .as_ref()
-                            .and_then(|l| l.theme.as_ref())
-                            .map(|vs| vs.name.clone());
+                        let following = self.code_theme.as_ref().map(|vs| vs.name.clone());
                         ui.add_enabled_ui(following.is_none(), |ui| {
                             for kind in ThemeKind::ALL {
                                 if ui.radio(self.theme == kind, kind.label()).clicked() {
@@ -721,14 +963,14 @@ impl App {
                         if let Some(name) = following {
                             ui.separator();
                             ui.label(
-                                RichText::new(format!("Following VS Code: {name}"))
+                                RichText::new(format!("VS Code theme: {name}"))
                                     .color(t.text_faint)
                                     .small(),
                             );
                             if ui.button("Use CodeCraft's themes").clicked() {
-                                self.settings.vscode_theme = false;
+                                self.settings.theme = CodeTheme::default();
                                 self.settings.set(ui.ctx());
-                                self.apply_theme(ui.ctx(), false);
+                                self.apply_theme(ui.ctx());
                             }
                         }
                     });
@@ -740,12 +982,39 @@ impl App {
         if let Some(i) = select {
             self.select_tab(i);
         }
+        if let Some(doc) = pin
+            .and_then(|i| self.tabs.get_mut(i))
+            .and_then(Tab::doc_mut)
+        {
+            doc.preview = false;
+        }
+        if let Some((from, to)) = moved {
+            self.move_tab(from, to);
+        }
         if let Some(i) = close {
             self.close_tab(i);
         }
         if open_settings {
             self.open_settings();
         }
+    }
+
+    /// Moves tab `from` to index `to`; the same tab stays active.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = if self.active == from {
+            to
+        } else if from < self.active && to >= self.active {
+            self.active - 1
+        } else if from > self.active && to <= self.active {
+            self.active + 1
+        } else {
+            self.active
+        };
     }
 
     /// The narrow bar on the far left: the explorer's button, settings at the bottom.
@@ -772,7 +1041,11 @@ impl App {
         };
         ui.spacing_mut().item_spacing.y = 0.0;
         let shown = |view| self.side_open && self.side_view == view;
-        let (files, search) = (shown(SideView::Explorer), shown(SideView::Search));
+        let (files, search, exts) = (
+            shown(SideView::Explorer),
+            shown(SideView::Search),
+            shown(SideView::Extensions),
+        );
         if item(ui, "files", "Explorer (Ctrl+Shift+E)", files).clicked() {
             self.toggle_view(SideView::Explorer);
         }
@@ -782,6 +1055,9 @@ impl App {
             } else {
                 self.show_search(false);
             }
+        }
+        if item(ui, "blocks", "Extensions (Ctrl+Shift+X)", exts).clicked() {
+            self.toggle_view(SideView::Extensions);
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             let on = matches!(self.tabs.get(self.active), Some(Tab::Settings));
@@ -904,7 +1180,6 @@ impl App {
 
     /// The settings tab's page, in the editor's place.
     fn settings_page(&mut self, ui: &mut Ui) {
-        let status = self.vscode_status();
         let mut changed = false;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
@@ -919,12 +1194,12 @@ impl App {
                         ui.visuals_mut().widgets.inactive.bg_fill = t.field_border;
                         ui.label(RichText::new("Settings").font(theme::semibold(22.0)));
                         ui.add_space(6.0);
-                        changed = self.settings.ui(ui, &status);
+                        changed = self.settings.ui(ui);
                     });
             });
         if changed {
             self.settings.set(ui.ctx());
-            self.apply_theme(ui.ctx(), false);
+            self.apply_theme(ui.ctx());
         }
     }
 
@@ -1028,6 +1303,7 @@ impl App {
         let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let (new_terminal, toggle_terminal) = terminal_keys(ctx);
         let explorer = pressed(cmd_shift, Key::E);
+        let extensions = pressed(cmd_shift, Key::X);
         let search = pressed(cmd_shift, Key::F);
         let search_replace = pressed(cmd_shift, Key::H);
         let side = pressed(Modifiers::COMMAND, Key::B);
@@ -1039,6 +1315,10 @@ impl App {
         if explorer {
             self.side_open = true;
             self.side_view = SideView::Explorer;
+        }
+        if extensions {
+            self.side_open = true;
+            self.side_view = SideView::Extensions;
         }
         if search || search_replace {
             self.show_search(search_replace);
@@ -1059,6 +1339,8 @@ impl App {
         let close = pressed(Modifiers::COMMAND, Key::W);
         let open = pressed(Modifiers::COMMAND, Key::O);
         let settings = pressed(Modifiers::COMMAND, Key::Comma);
+        let palette = pressed(Modifiers::COMMAND | Modifiers::SHIFT, Key::P);
+        let quick_open = pressed(Modifiers::COMMAND, Key::P);
         let prev = pressed(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab);
         let next = pressed(Modifiers::CTRL, Key::Tab);
         let find = pressed(Modifiers::COMMAND, Key::F);
@@ -1067,6 +1349,7 @@ impl App {
         let find_next = pressed(Modifiers::NONE, Key::F3);
         // Escape closes the find bar from it or from the editor, not from other fields.
         let escape = self.find.open
+            && !self.quick_open.open
             && ctx.input(|i| i.key_pressed(Key::Escape))
             && (FindBar::has_focus(ctx)
                 || !ctx.memory(|m| m.focused().is_some_and(|id| self.is_other_field(id))));
@@ -1095,11 +1378,21 @@ impl App {
         if open {
             self.pick_folder();
         }
-        if side {
-            self.side_open = !self.side_open;
-        }
         if settings {
             self.open_settings();
+        }
+        if palette {
+            if self.quick_open.commands_shown() {
+                self.quick_open.close();
+            } else {
+                self.quick_open.show_commands(self.commands());
+            }
+        } else if quick_open {
+            if self.quick_open.open && !self.quick_open.commands_shown() {
+                self.quick_open.close();
+            } else {
+                self.quick_open.show(self.explorer.root.as_deref(), ctx);
+            }
         }
         let n = self.tabs.len();
         if n > 0 && (next || prev) {
@@ -1114,8 +1407,25 @@ impl App {
 
     /// A text field of the side panel or a shell: Escape there isn't for the find bar.
     fn is_other_field(&self, id: egui::Id) -> bool {
-        SearchView::owns(id) || self.terminals.iter().any(|t| t.id == id)
+        SearchView::owns(id)
+            || id == QuickOpen::field_id()
+            || self.terminals.iter().any(|t| t.id == id)
     }
+}
+
+/// Shows a folder in the system's file manager.
+fn reveal(dir: &Path) -> std::io::Result<()> {
+    let program = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
 }
 
 /// Ctrl+` toggles the terminal panel and Ctrl+Shift+` opens a new terminal, as in VS Code. The
@@ -1180,25 +1490,14 @@ impl eframe::App for App {
             for doc in self.tabs.iter_mut().filter_map(Tab::doc_mut) {
                 doc.reload_if_changed();
             }
-            self.apply_theme(&ctx, false);
+            self.apply_theme(&ctx);
         }
         self.was_focused = focused;
 
         self.shortcuts(&ctx);
+        self.open_arriving(&ctx);
         let t = Tokens::get(&ctx);
 
-        egui::Panel::top("tabs")
-            .frame(
-                egui::Frame::new()
-                    .fill(t.tab_strip)
-                    .inner_margin(egui::Margin {
-                        left: 0,
-                        right: 6,
-                        top: 0,
-                        bottom: 0,
-                    }),
-            )
-            .show(ui, |ui| self.tab_strip(ui));
         egui::Panel::bottom("status")
             .exact_size(24.0)
             .frame(egui::Frame::new().fill(t.status_bar))
@@ -1210,10 +1509,10 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(t.activity_bar))
             .show(ui, |ui| self.activity_bar(ui));
         if self.side_open {
-            // egui remembers a panel's width by its id; this one's started at 260 before "side".
-            let panel = egui::Panel::left("explorer")
+            // egui remembers a panel's width by its id: a new default needs a new id.
+            let panel = egui::Panel::left("sidebar")
                 .resizable(true)
-                .default_size(520.0)
+                .default_size(380.0)
                 .size_range(160.0..=900.0)
                 .frame(egui::Frame::new().fill(t.sidebar));
             match self.side_view {
@@ -1222,6 +1521,7 @@ impl eframe::App for App {
                         .show(ui, |ui| self.explorer.ui(ui, &self.file_icons))
                         .inner;
                     match action {
+                        Some(explorer::Action::Preview(path)) => self.open_file_as(&path, true),
                         Some(explorer::Action::Open(path)) => self.open_file(&path),
                         Some(explorer::Action::OpenFolder) => self.pick_folder(),
                         None => {}
@@ -1236,7 +1536,7 @@ impl eframe::App for App {
                         .inner;
                     match action {
                         Some(search::Action::Open { path, line, cols }) => {
-                            self.open_file(&path);
+                            self.open_file_as(&path, true);
                             if let Some(doc) = self.active_doc_mut() {
                                 doc.select_in_line(line, cols);
                             }
@@ -1245,8 +1545,27 @@ impl eframe::App for App {
                         None => {}
                     }
                 }
+                SideView::Extensions => {
+                    let action = panel.show(ui, |ui| self.extensions.ui(ui)).inner;
+                    if let Some(action) = action {
+                        self.extension_action(action);
+                    }
+                }
             }
         }
+        // After the side panels, so the tabs start where the editor does.
+        egui::Panel::top("tabs")
+            .frame(
+                egui::Frame::new()
+                    .fill(t.tab_strip)
+                    .inner_margin(egui::Margin {
+                        left: 0,
+                        right: 6,
+                        top: 0,
+                        bottom: 0,
+                    }),
+            )
+            .show(ui, |ui| self.tab_strip(ui));
         if self.terminal_open {
             egui::Panel::bottom("terminal")
                 .resizable(true)
@@ -1256,22 +1575,42 @@ impl eframe::App for App {
                 .show(ui, |ui| self.terminal_panel(ui));
         }
 
-        let vscode = self.vscode.clone();
-        let syntax_theme = match vscode.as_ref().and_then(|l| l.theme.as_ref()) {
-            Some(vs) => Some(&vs.syntax),
-            None => highlight::default_theme(t.dark()),
+        let code_theme = self.code_theme.clone();
+        let syntax_theme = match (&code_theme, &self.settings.theme) {
+            (Some(vs), _) => Some(&vs.syntax),
+            (None, CodeTheme::Builtin(style)) => Some(style.theme(t.dark())),
+            (None, CodeTheme::VsCode(_)) => Some(highlight::SyntaxStyle::default().theme(t.dark())),
         };
         let font_size = self.settings.editor_font;
         let mut note = None;
-        egui::CentralPanel::default()
+        let editor = egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.editor))
             .show(ui, |ui| match self.tabs.get_mut(self.active) {
                 Some(Tab::Doc(doc)) => note = doc.ui(ui, font_size, syntax_theme, &mut self.find),
                 Some(Tab::Settings) => self.settings_page(ui),
                 None => self.welcome(ui),
-            });
+            })
+            .response
+            .rect;
+        let open_files: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(Tab::doc)
+            .map(|d| d.path.clone())
+            .collect();
+        match self
+            .quick_open
+            .ui(&ctx, editor, &open_files, &self.file_icons)
+        {
+            Some(quick_open::Picked::File(path)) => self.open_file(&path),
+            Some(quick_open::Picked::Command(id)) => self.run_command(&id),
+            None => {}
+        }
         if let Some(note) = note {
             self.show_note(note, false);
+        }
+        for doc in self.tabs.iter_mut().filter_map(Tab::doc_mut) {
+            doc.preview &= !doc.dirty;
         }
 
         self.closing_ui(&ctx);

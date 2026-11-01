@@ -1,0 +1,7 @@
+{
+  "name": "Tabify",
+  "version": "1.0.0",
+  "description": "Re-indents the open file with tabs instead of spaces.",
+  "icon": "icon.svg",
+  "main": "main.lua"
+}
