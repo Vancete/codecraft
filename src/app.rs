@@ -42,6 +42,8 @@ struct Saved {
     folder: Option<PathBuf>,
     /// Open files, in tab order.
     open: Vec<PathBuf>,
+    /// Where the settings tab is among them, when it's open.
+    settings_tab: Option<usize>,
     active: usize,
     expanded: Vec<PathBuf>,
     recent: Vec<PathBuf>,
@@ -57,14 +59,46 @@ enum Closing {
     Window,
 }
 
+/// An editor tab: a file, or the settings page.
+enum Tab {
+    Doc(Box<Document>),
+    Settings,
+}
+
+impl Tab {
+    fn doc(&self) -> Option<&Document> {
+        match self {
+            Tab::Doc(doc) => Some(doc.as_ref()),
+            Tab::Settings => None,
+        }
+    }
+
+    fn doc_mut(&mut self) -> Option<&mut Document> {
+        match self {
+            Tab::Doc(doc) => Some(doc.as_mut()),
+            Tab::Settings => None,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Tab::Doc(doc) => &doc.name,
+            Tab::Settings => "Settings",
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        self.doc().is_some_and(|d| d.dirty)
+    }
+}
+
 pub struct App {
     explorer: Explorer,
-    docs: Vec<Document>,
+    tabs: Vec<Tab>,
     active: usize,
     recent: Vec<PathBuf>,
     theme: ThemeKind,
     settings: Settings,
-    settings_open: bool,
     side_open: bool,
     /// VS Code's themes, when the setting is on.
     vscode: Option<Arc<vscode::Loaded>>,
@@ -90,12 +124,11 @@ impl App {
 
         let mut app = Self {
             explorer: Explorer::default(),
-            docs: Vec::new(),
+            tabs: Vec::new(),
             active: 0,
             recent: saved.recent,
             theme: saved.theme,
             settings: saved.settings,
-            settings_open: false,
             side_open: !saved.side_hidden,
             vscode: None,
             file_icons: FileIcons::default(),
@@ -111,12 +144,13 @@ impl App {
             app.explorer.expanded = saved.expanded.into_iter().filter(|p| p.is_dir()).collect();
         }
         for path in saved.open.iter().filter(|p| p.is_file()) {
-            app.docs.push(Document::open(path));
+            app.tabs.push(Tab::Doc(Box::new(Document::open(path))));
         }
-        app.active = saved.active.min(app.docs.len().saturating_sub(1));
-        if let Some(doc) = app.docs.get(app.active) {
-            app.explorer.selected = Some(doc.path.clone());
+        if let Some(at) = saved.settings_tab {
+            app.tabs.insert(at.min(app.tabs.len()), Tab::Settings);
         }
+        app.active = saved.active.min(app.tabs.len().saturating_sub(1));
+        app.explorer.selected = app.active_path();
         if let Some(path) = open_arg {
             app.open_path(&path);
         }
@@ -166,22 +200,48 @@ impl App {
     }
 
     fn open_file(&mut self, path: &Path) {
-        match self.docs.iter().position(|d| d.path == path) {
+        match self
+            .tabs
+            .iter()
+            .position(|t| t.doc().is_some_and(|d| d.path == path))
+        {
             Some(i) => self.active = i,
             None => {
-                self.docs.push(Document::open(path));
-                self.active = self.docs.len() - 1;
+                self.tabs.push(Tab::Doc(Box::new(Document::open(path))));
+                self.active = self.tabs.len() - 1;
             }
         }
-        if let Some(doc) = self.docs.get_mut(self.active) {
+        if let Some(doc) = self.tabs.get_mut(self.active).and_then(Tab::doc_mut) {
             doc.focus = true;
         }
         self.explorer.selected = Some(path.to_owned());
     }
 
+    /// Shows the settings tab, opening it after the others if it isn't open.
+    pub fn open_settings(&mut self) {
+        match self.tabs.iter().position(|t| matches!(t, Tab::Settings)) {
+            Some(i) => self.active = i,
+            None => {
+                self.tabs.push(Tab::Settings);
+                self.active = self.tabs.len() - 1;
+            }
+        }
+    }
+
+    /// The file of the active tab.
+    fn active_path(&self) -> Option<PathBuf> {
+        self.tabs
+            .get(self.active)
+            .and_then(Tab::doc)
+            .map(|d| d.path.clone())
+    }
+
     fn select_tab(&mut self, i: usize) {
-        if let Some(doc) = self.docs.get_mut(i) {
-            self.active = i;
+        let Some(tab) = self.tabs.get_mut(i) else {
+            return;
+        };
+        self.active = i;
+        if let Some(doc) = tab.doc_mut() {
             doc.focus = true;
             self.explorer.selected = Some(doc.path.clone());
         }
@@ -189,26 +249,26 @@ impl App {
 
     /// Closes a tab, asking first when it has unsaved changes.
     fn close_tab(&mut self, i: usize) {
-        match self.docs.get(i) {
-            Some(doc) if doc.dirty => self.closing = Some(Closing::Tab(i)),
+        match self.tabs.get(i) {
+            Some(tab) if tab.dirty() => self.closing = Some(Closing::Tab(i)),
             Some(_) => self.remove_tab(i),
             None => {}
         }
     }
 
     fn remove_tab(&mut self, i: usize) {
-        if i >= self.docs.len() {
+        if i >= self.tabs.len() {
             return;
         }
-        self.docs.remove(i);
-        if self.active > i || self.active >= self.docs.len() {
+        self.tabs.remove(i);
+        if self.active > i || self.active >= self.tabs.len() {
             self.active = self.active.saturating_sub(1);
         }
-        self.explorer.selected = self.docs.get(self.active).map(|d| d.path.clone());
+        self.explorer.selected = self.active_path();
     }
 
     fn save(&mut self, i: usize) -> bool {
-        let Some(doc) = self.docs.get_mut(i) else {
+        let Some(doc) = self.tabs.get_mut(i).and_then(Tab::doc_mut) else {
             return false;
         };
         match doc.save() {
@@ -273,18 +333,22 @@ impl App {
         let t = Tokens::get(ui.ctx());
         let mut select = None;
         let mut close = None;
+        let mut open_settings = false;
         ui.horizontal(|ui| {
             ui.set_min_height(TAB_H);
             ui.spacing_mut().item_spacing.x = 1.0;
-            for (i, doc) in self.docs.iter().enumerate() {
+            for (i, tab) in self.tabs.iter().enumerate() {
                 let active = i == self.active;
+                let dirty = tab.dirty();
                 let font = if active {
                     theme::medium(12.5)
                 } else {
                     egui::FontId::proportional(12.5)
                 };
                 let color = if active { t.text } else { t.text_dim };
-                let galley = ui.painter().layout_no_wrap(doc.name.clone(), font, color);
+                let galley = ui
+                    .painter()
+                    .layout_no_wrap(tab.name().to_owned(), font, color);
                 let w = (galley.size().x + 66.0).clamp(110.0, 260.0);
                 let (rect, resp) = ui.allocate_exact_size(vec2(w, TAB_H), Sense::click());
                 let hovered = resp.hovered();
@@ -302,14 +366,14 @@ impl App {
                     p.rect_filled(rect, 0.0, t.hover.gamma_multiply(0.6));
                 }
                 let y = rect.center().y;
-                self.file_icons.paint_file(
-                    ui,
-                    Rect::from_center_size(
-                        pos2(rect.left() + 18.0, y),
-                        vec2(file_icons::SIZE, file_icons::SIZE),
-                    ),
-                    &doc.name,
+                let icon_rect = Rect::from_center_size(
+                    pos2(rect.left() + 18.0, y),
+                    vec2(file_icons::SIZE, file_icons::SIZE),
                 );
+                match tab {
+                    Tab::Doc(doc) => self.file_icons.paint_file(ui, icon_rect, &doc.name),
+                    Tab::Settings => icons::paint(ui, icon_rect, "settings", 14.0, t.icon),
+                }
                 let text_clip = Rect::from_min_max(
                     pos2(rect.left() + 32.0, rect.top()),
                     pos2(rect.right() - 28.0, rect.bottom()),
@@ -324,7 +388,7 @@ impl App {
                 let close_rect =
                     Rect::from_center_size(pos2(rect.right() - 15.0, y), vec2(18.0, 18.0));
                 let c = ui.interact(close_rect, resp.id.with("close"), Sense::click());
-                if c.hovered() || ((active || hovered) && !doc.dirty) {
+                if c.hovered() || ((active || hovered) && !dirty) {
                     if c.hovered() {
                         ui.painter().rect_filled(close_rect, t.radius_sm, t.pressed);
                     }
@@ -335,7 +399,7 @@ impl App {
                         12.0,
                         if c.hovered() { t.text } else { t.text_faint },
                     );
-                } else if doc.dirty {
+                } else if dirty {
                     editor::paint_dirty_dot(
                         ui,
                         close_rect,
@@ -346,7 +410,11 @@ impl App {
                     close = Some(i);
                 }
                 c.on_hover_text("Close (Ctrl+W)");
-                let resp = resp.on_hover_text(doc.path.display().to_string());
+                let tip = match tab {
+                    Tab::Doc(doc) => doc.path.display().to_string(),
+                    Tab::Settings => "Settings".to_owned(),
+                };
+                let resp = resp.on_hover_text(tip);
                 if resp.clicked() && close.is_none() {
                     select = Some(i);
                 }
@@ -359,7 +427,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if icons::bar_button(ui, "settings", "Settings (Ctrl+,)").clicked() {
-                    self.settings_open = true;
+                    open_settings = true;
                 }
                 let resp = icons::bar_button(ui, "palette", "Theme");
                 egui::Popup::menu(&resp)
@@ -407,6 +475,9 @@ impl App {
         if let Some(i) = close {
             self.close_tab(i);
         }
+        if open_settings {
+            self.open_settings();
+        }
     }
 
     /// The narrow bar on the far left: the explorer's button, settings at the bottom.
@@ -436,8 +507,9 @@ impl App {
             self.side_open = !self.side_open;
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            if item(ui, "settings", "Settings (Ctrl+,)", false).clicked() {
-                self.settings_open = true;
+            let on = matches!(self.tabs.get(self.active), Some(Tab::Settings));
+            if item(ui, "settings", "Settings (Ctrl+,)", on).clicked() {
+                self.open_settings();
             }
         });
     }
@@ -470,7 +542,7 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
-                if let Some(doc) = self.docs.get(self.active)
+                if let Some(doc) = self.tabs.get(self.active).and_then(Tab::doc)
                     && matches!(doc.content, editor::Content::Text(_))
                 {
                     ui.label(small(doc.language().to_owned(), t.text_dim));
@@ -549,41 +621,29 @@ impl App {
         }
     }
 
-    fn settings_ui(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-        let t = Tokens::get(ctx);
-        let frame = egui::Frame::new()
-            .fill(t.card)
-            .stroke(Stroke::new(1.0, t.field_border))
-            .corner_radius(t.radius_lg)
-            .inner_margin(egui::Margin::same(18))
-            .shadow(ctx.global_style().visuals.window_shadow);
+    /// The settings tab's page, in the editor's place.
+    fn settings_page(&mut self, ui: &mut Ui) {
         let status = self.vscode_status();
-        let mut close = false;
         let mut changed = false;
-        let resp = egui::Modal::new(egui::Id::new("settings"))
-            .frame(frame)
-            .backdrop_color(egui::Color32::from_black_alpha(110))
-            .show(ctx, |ui| {
-                ui.set_width(480.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Settings").font(theme::semibold(16.0)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icons::small_button(ui, "x", "Close").clicked() {
-                            close = true;
-                        }
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(40, 28))
+                    .show(ui, |ui| {
+                        ui.set_max_width(640.0);
+                        // Fields can share the editor's background (VS Code themes): keep
+                        // the slider rails visible on it.
+                        let t = Tokens::get(ui.ctx());
+                        ui.visuals_mut().widgets.inactive.bg_fill = t.field_border;
+                        ui.label(RichText::new("Settings").font(theme::semibold(22.0)));
+                        ui.add_space(6.0);
+                        changed = self.settings.ui(ui, &status);
                     });
-                });
-                changed = self.settings.ui(ui, &status);
             });
         if changed {
-            self.settings.set(ctx);
-            self.apply_theme(ctx, false);
-        }
-        if close || resp.should_close() {
-            self.settings_open = false;
+            self.settings.set(ui.ctx());
+            self.apply_theme(ui.ctx(), false);
         }
     }
 
@@ -594,8 +654,8 @@ impl App {
         };
         let dirty: Vec<usize> = match closing {
             Closing::Tab(i) => vec![i],
-            Closing::Window => (0..self.docs.len())
-                .filter(|&i| self.docs[i].dirty)
+            Closing::Window => (0..self.tabs.len())
+                .filter(|&i| self.tabs[i].dirty())
                 .collect(),
         };
         let t = Tokens::get(ctx);
@@ -608,7 +668,7 @@ impl App {
         let question = match dirty.as_slice() {
             [i] => format!(
                 "Save the changes to {}?",
-                self.docs.get(*i).map_or("", |d| d.name.as_str())
+                self.tabs.get(*i).map_or("", Tab::name)
             ),
             many => format!("Save the changes to {} files?", many.len()),
         };
@@ -677,7 +737,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.closing.is_some() || self.settings_open {
+        if self.closing.is_some() {
             return;
         }
         let pressed = |mods: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(mods, key));
@@ -701,9 +761,9 @@ impl App {
             self.side_open = !self.side_open;
         }
         if settings {
-            self.settings_open = true;
+            self.open_settings();
         }
-        let n = self.docs.len();
+        let n = self.tabs.len();
         if n > 0 && (next || prev) {
             let to = if next {
                 (self.active + 1) % n
@@ -732,7 +792,7 @@ impl eframe::App for App {
         // Unsaved files: ask before the window closes.
         if ctx.input(|i| i.viewport().close_requested())
             && !self.close_confirmed
-            && self.docs.iter().any(|d| d.dirty)
+            && self.tabs.iter().any(Tab::dirty)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing = Some(Closing::Window);
@@ -742,7 +802,7 @@ impl eframe::App for App {
         let focused = ctx.input(|i| i.focused);
         if focused && !self.was_focused {
             self.explorer.refresh();
-            for doc in &mut self.docs {
+            for doc in self.tabs.iter_mut().filter_map(Tab::doc_mut) {
                 doc.reload_if_changed();
             }
             self.apply_theme(&ctx, false);
@@ -775,10 +835,11 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(t.activity_bar))
             .show(ui, |ui| self.activity_bar(ui));
         if self.side_open {
-            let action = egui::Panel::left("side")
+            // Not "side": egui remembers a panel's width by its id, and the old default was 260.
+            let action = egui::Panel::left("explorer")
                 .resizable(true)
-                .default_size(260.0)
-                .size_range(160.0..=640.0)
+                .default_size(520.0)
+                .size_range(160.0..=900.0)
                 .frame(egui::Frame::new().fill(t.sidebar))
                 .show(ui, |ui| self.explorer.ui(ui, &self.file_icons))
                 .inner;
@@ -797,19 +858,25 @@ impl eframe::App for App {
         let font_size = self.settings.editor_font;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.editor))
-            .show(ui, |ui| match self.docs.get_mut(self.active) {
-                Some(doc) => doc.ui(ui, font_size, syntax_theme),
+            .show(ui, |ui| match self.tabs.get_mut(self.active) {
+                Some(Tab::Doc(doc)) => doc.ui(ui, font_size, syntax_theme),
+                Some(Tab::Settings) => self.settings_page(ui),
                 None => self.welcome(ui),
             });
 
-        self.settings_ui(&ctx);
         self.closing_ui(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let saved = Saved {
             folder: self.explorer.root.clone(),
-            open: self.docs.iter().map(|d| d.path.clone()).collect(),
+            open: self
+                .tabs
+                .iter()
+                .filter_map(Tab::doc)
+                .map(|d| d.path.clone())
+                .collect(),
+            settings_tab: self.tabs.iter().position(|t| matches!(t, Tab::Settings)),
             active: self.active,
             expanded: self.explorer.expanded.iter().cloned().collect(),
             recent: self.recent.clone(),

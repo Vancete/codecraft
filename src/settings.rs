@@ -60,6 +60,7 @@ impl Settings {
                 ui.label("Zoom");
                 ui.add(
                     egui::Slider::new(&mut self.ui_scale, 0.7..=2.0)
+                        .trailing_fill(true)
                         .step_by(0.05)
                         .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
                 );
@@ -91,7 +92,11 @@ impl Settings {
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
                 ui.label("Font size");
-                ui.add(egui::Slider::new(&mut self.editor_font, 9.0..=24.0).step_by(0.5));
+                ui.add(
+                    egui::Slider::new(&mut self.editor_font, 9.0..=24.0)
+                        .step_by(0.5)
+                        .trailing_fill(true),
+                );
                 ui.end_row();
             });
         *self != before
