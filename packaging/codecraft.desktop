@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=CodeCraft
+Comment=A small, fast-starting code editor
+Exec=codecraft %F
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/plain;inode/directory;
+Icon=codecraft
+StartupWMClass=codecraft

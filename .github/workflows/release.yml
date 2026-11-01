@@ -1,0 +1,160 @@
+# Builds CodeCraft for Windows, Linux and macOS and publishes a GitHub release when a `v*` tag is pushed.
+# Run it by hand (Actions › Release › Run workflow) to only build and download the artifacts.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x86_64
+          # The oldest supported runner, so the binary runs on older glibc too.
+          - os: ubuntu-22.04
+            name: linux-x86_64
+          # Builds for Apple silicon and Intel, joined into one universal app.
+          - os: macos-latest
+            name: macos-universal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgtk-3-dev libdbus-1-dev pkg-config
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        if: runner.os != 'macOS'
+        run: cargo build --release --locked
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: App, dmg and zip (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          name="codecraft-${{ github.ref_name }}-${{ matrix.name }}"
+          version="$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)"
+          sh packaging/macos/build-app.sh "$version" "$name"
+          # Both architectures, signed, and the disk image is sound.
+          mkdir check
+          ditto -x -k "$name.zip" check
+          lipo -archs check/codecraft.app/Contents/MacOS/codecraft
+          lipo -archs check/codecraft.app/Contents/MacOS/codecraft | grep -q x86_64
+          lipo -archs check/codecraft.app/Contents/MacOS/codecraft | grep -q arm64
+          codesign --verify --strict check/codecraft.app
+          plutil -lint check/codecraft.app/Contents/Info.plist
+          hdiutil verify "$name.dmg"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "codecraft-${{ github.ref_name }}-${{ matrix.name }}"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/codecraft.exe, README.md, ATTRIBUTION.md, LICENSE-MIT, LICENSE-APACHE $dir
+          # The example extensions, next to the executable where CodeCraft looks for them.
+          Copy-Item -Recurse target/release/extensions $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - name: Installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp "/DAppVersion=$version" "/DOutputName=codecraft-${{ github.ref_name }}-${{ matrix.name }}-setup" packaging\windows\codecraft.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Move-Item dist\*.exe .
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dir="codecraft-${{ github.ref_name }}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/codecraft README.md ATTRIBUTION.md LICENSE-MIT LICENSE-APACHE \
+            packaging/codecraft.desktop "$dir/"
+          cp -R target/release/extensions "$dir/"
+          cp assets/app-icon/codecraft-256.png "$dir/codecraft.png"
+          strip "$dir/codecraft"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: AppImage (Linux)
+        if: runner.os == 'Linux'
+        env:
+          # The runner has no FUSE: appimagetool unpacks itself instead.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          sudo chmod +x /usr/local/bin/appimagetool
+          sh packaging/linux/build-appimage.sh "codecraft-${{ github.ref_name }}-${{ matrix.name }}.AppImage"
+
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: deb and rpm (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="codecraft-${{ github.ref_name }}-${{ matrix.name }}"
+          strip target/release/codecraft
+          cargo deb --no-build --output "$name.deb"
+          cargo generate-rpm --output "$name.rpm"
+          # The .deb installs, with its menu entry and icon; the .rpm holds the same files.
+          sudo apt-get install -y desktop-file-utils rpm "./$name.deb"
+          desktop-file-validate /usr/share/applications/codecraft.desktop
+          test -x /usr/bin/codecraft
+          test -f /usr/share/icons/hicolor/256x256/apps/codecraft.png
+          rpm -qp --requires "$name.rpm"
+          rpm -qlp "$name.rpm"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codecraft-${{ matrix.name }}
+          path: |
+            codecraft-*.zip
+            codecraft-*.dmg
+            codecraft-*.tar.gz
+            codecraft-*-setup.exe
+            codecraft-*.AppImage
+            codecraft-*.deb
+            codecraft-*.rpm
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
