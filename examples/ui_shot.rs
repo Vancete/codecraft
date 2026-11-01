@@ -4,7 +4,7 @@
 //! `cargo run --example ui_shot -- <folder> <out-prefix> [step]...`
 //!
 //! Steps (coordinates in points, window is 1400×860):
-//! `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `drag:x1,y1,x2,y2`, `leave` (pointer off the window), `open:path` (a folder or a file), `vscode:on|off` (the VS Code theme setting), `key:Escape`, `ckey:P` (Ctrl/Cmd+key), `type:text`, `wait:ms`, `shot`.
+//! `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `drag:x1,y1,x2,y2`, `leave` (pointer off the window), `open:path` (a folder or a file), `vscode:on|off` (the VS Code theme setting), `key:Escape`, `ckey:P` (Ctrl/Cmd+key), `cskey:F` (Ctrl+Shift+key), `skey:F3` (Shift+key), `type:text`, `wait:ms`, `shot`.
 //! Each `shot` writes `<out-prefix>-<n>.png`.
 
 use std::time::{Duration, Instant};
@@ -157,9 +157,14 @@ fn main() {
                 }
                 settle(&mut harness, 200);
             }
-            "ckey" => {
+            "ckey" | "cskey" | "skey" => {
+                let mods = match cmd {
+                    "ckey" => Modifiers::COMMAND,
+                    "cskey" => Modifiers::COMMAND | Modifiers::SHIFT,
+                    _ => Modifiers::SHIFT,
+                };
                 if let Some(key) = Key::from_name(arg) {
-                    harness.key_press_modifiers(Modifiers::COMMAND, key);
+                    harness.key_press_modifiers(mods, key);
                 }
                 settle(&mut harness, 300);
             }

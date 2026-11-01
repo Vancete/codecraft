@@ -14,6 +14,9 @@ pub struct Settings {
     pub editor_font: f32,
     /// Colour code and file icons as VS Code does (its colour and file icon themes), when found.
     pub vscode_theme: bool,
+    /// Program of the terminal's shell; empty = the platform's default.
+    pub shell: String,
+    pub terminal_font: f32,
 }
 
 impl Default for Settings {
@@ -22,6 +25,8 @@ impl Default for Settings {
             ui_scale: 1.0,
             editor_font: 13.0,
             vscode_theme: true,
+            shell: String::new(),
+            terminal_font: 13.0,
         }
     }
 }
@@ -94,6 +99,36 @@ impl Settings {
                 ui.label("Font size");
                 ui.add(
                     egui::Slider::new(&mut self.editor_font, 9.0..=24.0)
+                        .step_by(0.5)
+                        .trailing_fill(true),
+                );
+                ui.end_row();
+            });
+
+        section(ui, "TERMINAL");
+        egui::Grid::new("settings-term")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Shell");
+                let shells = crate::terminal::available_shells();
+                let current = shells
+                    .iter()
+                    .find(|s| s.program == self.shell)
+                    .map(|s| s.label.clone())
+                    .unwrap_or_else(|| "System default".to_owned());
+                egui::ComboBox::from_id_salt("settings-shell")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.shell, String::new(), "System default");
+                        for s in &shells {
+                            ui.selectable_value(&mut self.shell, s.program.clone(), &s.label);
+                        }
+                    });
+                ui.end_row();
+                ui.label("Font size");
+                ui.add(
+                    egui::Slider::new(&mut self.terminal_font, 9.0..=24.0)
                         .step_by(0.5)
                         .trailing_fill(true),
                 );

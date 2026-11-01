@@ -13,12 +13,18 @@ eframe = { version = "0.36", default-features = false, features = ["default_font
 egui = "0.36"
 egui_extras = { version = "0.36", default-features = false, features = ["svg", "image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Walks the folder for the search view, skipping what .gitignore lists (ripgrep's walker).
+ignore = "0.4"
 # Inflates the WOFF fonts that font-based VS Code icon themes (Seti) ship.
 miniz_oxide = "0.8"
+# The terminal panel: the shell in a pseudo-terminal, its output interpreted as xterm does.
+portable-pty = "0.9"
+regex = "1"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+vt100 = "0.18"
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -81,6 +81,9 @@ pub struct Tokens {
     pub line_highlight: Color32,
     /// Behind selected text.
     pub text_selection: Color32,
+    /// Matches of the find bar's query, and the one it's on.
+    pub find_match: Color32,
+    pub find_match_current: Color32,
     pub radius_sm: f32,
     pub radius: f32,
     pub radius_lg: f32,
@@ -120,6 +123,8 @@ impl Tokens {
                 gutter_active: Color32::from_rgb(200, 200, 200),
                 line_highlight: Color32::from_rgb(46, 46, 46),
                 text_selection: Color32::from_rgb(38, 79, 120),
+                find_match: over(Color32::from_rgb(40, 40, 40), FIND_HIGHLIGHT),
+                find_match_current: Color32::from_rgb(158, 106, 3),
                 radius_sm: 3.0,
                 radius: 4.0,
                 radius_lg: 6.0,
@@ -149,6 +154,7 @@ impl Tokens {
                 gutter_active: Color32::from_rgb(230, 230, 230),
                 line_highlight: Color32::from_rgb(72, 72, 72),
                 text_selection: Color32::from_rgb(52, 98, 150),
+                find_match: over(Color32::from_rgb(66, 66, 66), FIND_HIGHLIGHT),
                 ..Tokens::for_kind(ThemeKind::Dark)
             },
             ThemeKind::Light => Tokens {
@@ -182,6 +188,8 @@ impl Tokens {
                 gutter_active: Color32::from_rgb(40, 40, 40),
                 line_highlight: Color32::from_rgb(242, 242, 242),
                 text_selection: Color32::from_rgb(190, 214, 245),
+                find_match: over(Color32::from_rgb(252, 252, 252), FIND_HIGHLIGHT),
+                find_match_current: Color32::from_rgb(168, 172, 148),
                 ..Tokens::for_kind(ThemeKind::Dark)
             },
         }
@@ -264,6 +272,11 @@ impl Tokens {
             gutter_active: solid(&["editorLineNumber.activeForeground"], text),
             line_highlight: solid(&["editor.lineHighlightBackground"], mix(editor, text, 0.04)),
             text_selection: solid(&["editor.selectionBackground"], base.text_selection),
+            find_match: solid(
+                &["editor.findMatchHighlightBackground"],
+                over(editor, FIND_HIGHLIGHT),
+            ),
+            find_match_current: solid(&["editor.findMatchBackground"], base.find_match_current),
             ..base
         }
     }
@@ -277,6 +290,9 @@ impl Tokens {
             .unwrap_or_else(|| Tokens::for_kind(ThemeKind::default()))
     }
 }
+
+/// VS Code's colour for the find bar's other matches, laid over the editor.
+const FIND_HIGHLIGHT: Color32 = Color32::from_rgba_unmultiplied_const(234, 92, 0, 85);
 
 /// `top` painted over `bottom`, opaque.
 fn over(bottom: Color32, top: Color32) -> Color32 {

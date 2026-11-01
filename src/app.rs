@@ -1,19 +1,23 @@
-//! Window shell: the tab strip, the activity bar, the explorer, the editor and the status bar.
+//! Window shell: the tab strip, the activity bar, the side panel (explorer or search), the
+//! editor, the terminal panel and the status bar.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use egui::{Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Event, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::editor::{self, Document};
 use crate::explorer::{self, Explorer};
 use crate::file_icons::{self, FileIcons};
+use crate::find::FindBar;
 use crate::highlight;
 use crate::icons;
+use crate::search::{self, SearchView};
 use crate::settings::{Settings, VsCodeStatus};
+use crate::terminal::{self, ShellSpec, Terminal};
 use crate::theme::{self, ThemeKind, Tokens};
 use crate::vscode;
 
@@ -50,6 +54,17 @@ struct Saved {
     theme: ThemeKind,
     settings: Settings,
     side_hidden: bool,
+    side_view: SideView,
+    search: SearchView,
+    find: FindBar,
+}
+
+/// What the side panel shows.
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+enum SideView {
+    #[default]
+    Explorer,
+    Search,
 }
 
 /// Something waiting on "save your changes?".
@@ -100,6 +115,15 @@ pub struct App {
     theme: ThemeKind,
     settings: Settings,
     side_open: bool,
+    side_view: SideView,
+    search: SearchView,
+    find: FindBar,
+    terminals: Vec<Terminal>,
+    active_terminal: usize,
+    terminal_open: bool,
+    terminal_error: Option<String>,
+    /// Files whose search matches wait on "replace them all?".
+    confirm_replace: Option<Vec<PathBuf>>,
     /// VS Code's themes, when the setting is on.
     vscode: Option<Arc<vscode::Loaded>>,
     file_icons: FileIcons,
@@ -130,6 +154,14 @@ impl App {
             theme: saved.theme,
             settings: saved.settings,
             side_open: !saved.side_hidden,
+            side_view: saved.side_view,
+            search: saved.search,
+            find: saved.find,
+            terminals: Vec::new(),
+            active_terminal: 0,
+            terminal_open: false,
+            terminal_error: None,
+            confirm_replace: None,
             vscode: None,
             file_icons: FileIcons::default(),
             note: None,
@@ -244,6 +276,242 @@ impl App {
         if let Some(doc) = tab.doc_mut() {
             doc.focus = true;
             self.explorer.selected = Some(doc.path.clone());
+        }
+    }
+
+    fn active_doc(&self) -> Option<&Document> {
+        self.tabs.get(self.active).and_then(Tab::doc)
+    }
+
+    fn active_doc_mut(&mut self) -> Option<&mut Document> {
+        self.tabs.get_mut(self.active).and_then(Tab::doc_mut)
+    }
+
+    /// Shows a view in the side panel; the button of the view already shown hides the panel.
+    fn toggle_view(&mut self, view: SideView) {
+        if self.side_open && self.side_view == view {
+            self.side_open = false;
+        } else {
+            self.side_open = true;
+            self.side_view = view;
+        }
+    }
+
+    /// The search view with its field focused, holding the editor's selection if any.
+    fn show_search(&mut self, replace: bool) {
+        self.side_open = true;
+        self.side_view = SideView::Search;
+        self.search.focus = true;
+        self.search.replace_open |= replace;
+        if let Some(text) = self.active_doc().and_then(Document::selected_text) {
+            self.search.query.text = text;
+        }
+    }
+
+    /// The editor's find bar, holding the selection if any.
+    fn show_find(&mut self, replace: bool) {
+        let Some(doc) = self.active_doc() else {
+            return;
+        };
+        if let Some(text) = doc.selected_text() {
+            self.find.query.text = text;
+        }
+        self.find.open = true;
+        self.find.focus = true;
+        self.find.replace_open |= replace;
+    }
+
+    fn toggle_terminal(&mut self, ctx: &egui::Context) {
+        self.terminal_open = !self.terminal_open;
+        if !self.terminal_open {
+            return;
+        }
+        match self.terminals.get(self.active_terminal) {
+            Some(term) => ctx.memory_mut(|m| m.request_focus(term.id)),
+            None => self.start_terminal(None, ctx),
+        }
+    }
+
+    /// A new shell in the open folder (the home folder without one), focused.
+    fn start_terminal(&mut self, shell: Option<ShellSpec>, ctx: &egui::Context) {
+        let shell = shell.unwrap_or_else(|| terminal::default_shell(&self.settings.shell));
+        let cwd = self
+            .explorer
+            .root
+            .clone()
+            .or_else(|| {
+                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.terminal_open = true;
+        match Terminal::spawn(&cwd, &shell, ctx) {
+            Ok(term) => {
+                ctx.memory_mut(|m| m.request_focus(term.id));
+                self.terminals.push(term);
+                self.active_terminal = self.terminals.len() - 1;
+                self.terminal_error = None;
+            }
+            Err(e) => self.terminal_error = Some(e),
+        }
+    }
+
+    fn close_terminal(&mut self, i: usize) {
+        if i < self.terminals.len() {
+            self.terminals.remove(i);
+        }
+        self.active_terminal = self
+            .active_terminal
+            .min(self.terminals.len().saturating_sub(1));
+        if self.terminals.is_empty() {
+            self.terminal_open = false;
+        }
+    }
+
+    /// The bottom panel: the shells' tabs and the active one. A shell that exits is closed.
+    fn terminal_panel(&mut self, ui: &mut Ui) {
+        let t = Tokens::get(ui.ctx());
+        let action = terminal::tabs(ui, &self.terminals, self.active_terminal);
+        if let Some(err) = &self.terminal_error {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.colored_label(t.danger, err);
+            });
+        }
+        let i = self.active_terminal;
+        if let Some(term) = self.terminals.get_mut(i) {
+            if term.has_exited() {
+                self.close_terminal(i);
+            } else {
+                term.ui(ui, self.settings.terminal_font);
+            }
+        }
+        let ctx = ui.ctx().clone();
+        match action {
+            Some(terminal::TabAction::Select(i)) => {
+                self.active_terminal = i;
+                if let Some(term) = self.terminals.get(i) {
+                    ctx.memory_mut(|m| m.request_focus(term.id));
+                }
+            }
+            Some(terminal::TabAction::Close(i)) => self.close_terminal(i),
+            Some(terminal::TabAction::New(shell)) => self.start_terminal(shell, &ctx),
+            Some(terminal::TabAction::Hide) => self.terminal_open = false,
+            None => {}
+        }
+    }
+
+    /// Replaces the search view's matches in `files`: in the editor for open files (saved
+    /// unless they had unsaved changes), on disk for the others. Then searches again.
+    fn replace_in_files(&mut self, files: &[PathBuf], ctx: &egui::Context) {
+        let Some((re, query, with)) = self.search.replacing() else {
+            return;
+        };
+        let (mut total, mut changed) = (0, 0);
+        let mut error = None;
+        for path in files {
+            let open = self
+                .tabs
+                .iter_mut()
+                .filter_map(Tab::doc_mut)
+                .find(|d| d.path == *path && matches!(d.content, editor::Content::Text(_)));
+            let n = match open {
+                Some(doc) => {
+                    let had_changes = doc.dirty;
+                    let n = doc.replace_matches(&re, &query, &with);
+                    if n > 0
+                        && !had_changes
+                        && let Err(e) = doc.save()
+                    {
+                        error = Some(e);
+                    }
+                    n
+                }
+                None => search::replace_in_file(path, &re, &query, &with).unwrap_or_else(|e| {
+                    error = Some(e);
+                    0
+                }),
+            };
+            total += n;
+            changed += usize::from(n > 0);
+        }
+        match error {
+            Some(e) => self.show_note(e, true),
+            None => self.show_note(
+                format!(
+                    "Replaced {total} occurrence{} in {changed} file{}",
+                    if total == 1 { "" } else { "s" },
+                    if changed == 1 { "" } else { "s" }
+                ),
+                false,
+            ),
+        }
+        let root = self.explorer.root.clone();
+        self.search.search_now(root.as_deref(), ctx);
+    }
+
+    /// "Replace all?" before the search view changes files.
+    fn confirm_replace_ui(&mut self, ctx: &egui::Context) {
+        let Some(files) = &self.confirm_replace else {
+            return;
+        };
+        let (matches, count) = self.search.count(files);
+        let t = Tokens::get(ctx);
+        let frame = egui::Frame::new()
+            .fill(t.card)
+            .stroke(Stroke::new(1.0, t.field_border))
+            .corner_radius(t.radius_lg)
+            .inner_margin(egui::Margin::same(18))
+            .shadow(ctx.global_style().visuals.window_shadow);
+        let plural = |n: usize, one: &str, many: &str| {
+            if n == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{n} {many}")
+            }
+        };
+        let question = format!(
+            "Replace {} across {} with '{}'?",
+            plural(matches, "occurrence", "occurrences"),
+            plural(count, "file", "files"),
+            self.search.replace
+        );
+        let mut answer = None;
+        let resp = egui::Modal::new(egui::Id::new("confirm-replace"))
+            .frame(frame)
+            .backdrop_color(egui::Color32::from_black_alpha(110))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(RichText::new(question).font(theme::semibold(15.0)));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Files that aren't open are changed on disk.").color(t.text_dim),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    let replace = egui::Button::new(RichText::new("Replace").color(t.accent_text))
+                        .fill(t.accent)
+                        .min_size(vec2(90.0, 30.0));
+                    if ui.add(replace).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                        answer = Some(true);
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(vec2(80.0, 30.0)))
+                        .clicked()
+                    {
+                        answer = Some(false);
+                    }
+                });
+            });
+        if resp.should_close() {
+            answer = Some(false);
+        }
+        if let Some(yes) = answer
+            && let Some(files) = self.confirm_replace.take()
+            && yes
+        {
+            self.replace_in_files(&files, ctx);
         }
     }
 
@@ -503,13 +771,26 @@ impl App {
             resp.on_hover_text(tip)
         };
         ui.spacing_mut().item_spacing.y = 0.0;
-        if item(ui, "files", "Explorer (Ctrl+B)", self.side_open).clicked() {
-            self.side_open = !self.side_open;
+        let shown = |view| self.side_open && self.side_view == view;
+        let (files, search) = (shown(SideView::Explorer), shown(SideView::Search));
+        if item(ui, "files", "Explorer (Ctrl+Shift+E)", files).clicked() {
+            self.toggle_view(SideView::Explorer);
+        }
+        if item(ui, "search", "Search (Ctrl+Shift+F)", search).clicked() {
+            if search {
+                self.side_open = false;
+            } else {
+                self.show_search(false);
+            }
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             let on = matches!(self.tabs.get(self.active), Some(Tab::Settings));
             if item(ui, "settings", "Settings (Ctrl+,)", on).clicked() {
                 self.open_settings();
+            }
+            let tip = "Terminal (Ctrl+`)";
+            if item(ui, "square-terminal", tip, self.terminal_open).clicked() {
+                self.toggle_terminal(ui.ctx());
             }
         });
     }
@@ -736,18 +1017,75 @@ impl App {
         }
     }
 
+    /// VS Code's shortcuts. While a shell has the keyboard, only the ones for the panels are
+    /// taken; the rest go to the shell.
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.closing.is_some() {
+        if self.closing.is_some() || self.confirm_replace.is_some() {
             return;
         }
+        // Shift and Alt don't have to match unless asked for: the longer shortcuts go first.
         let pressed = |mods: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(mods, key));
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        let (new_terminal, toggle_terminal) = terminal_keys(ctx);
+        let explorer = pressed(cmd_shift, Key::E);
+        let search = pressed(cmd_shift, Key::F);
+        let search_replace = pressed(cmd_shift, Key::H);
+        let side = pressed(Modifiers::COMMAND, Key::B);
+        if new_terminal {
+            self.start_terminal(None, ctx);
+        } else if toggle_terminal {
+            self.toggle_terminal(ctx);
+        }
+        if explorer {
+            self.side_open = true;
+            self.side_view = SideView::Explorer;
+        }
+        if search || search_replace {
+            self.show_search(search_replace);
+        }
+        if side {
+            self.side_open = !self.side_open;
+        }
+        let in_terminal = self.terminal_open
+            && self
+                .terminals
+                .get(self.active_terminal)
+                .is_some_and(|t| t.has_focus(ctx));
+        if in_terminal {
+            return;
+        }
+
         let save = pressed(Modifiers::COMMAND, Key::S);
         let close = pressed(Modifiers::COMMAND, Key::W);
         let open = pressed(Modifiers::COMMAND, Key::O);
-        let side = pressed(Modifiers::COMMAND, Key::B);
         let settings = pressed(Modifiers::COMMAND, Key::Comma);
         let prev = pressed(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab);
         let next = pressed(Modifiers::CTRL, Key::Tab);
+        let find = pressed(Modifiers::COMMAND, Key::F);
+        let replace = pressed(Modifiers::COMMAND, Key::H);
+        let find_prev = pressed(Modifiers::SHIFT, Key::F3);
+        let find_next = pressed(Modifiers::NONE, Key::F3);
+        // Escape closes the find bar from it or from the editor, not from other fields.
+        let escape = self.find.open
+            && ctx.input(|i| i.key_pressed(Key::Escape))
+            && (FindBar::has_focus(ctx)
+                || !ctx.memory(|m| m.focused().is_some_and(|id| self.is_other_field(id))));
+        if find || replace {
+            self.show_find(replace);
+        }
+        if find_prev || find_next {
+            self.find.open = self.active_doc().is_some();
+            let query = self.find.query.clone();
+            if let Some(doc) = self.active_doc_mut() {
+                doc.find_step(&query, find_next);
+            }
+        }
+        if escape {
+            self.find.open = false;
+            if let Some(doc) = self.active_doc_mut() {
+                doc.focus = true;
+            }
+        }
         if save {
             self.save(self.active);
         }
@@ -773,6 +1111,43 @@ impl App {
             self.select_tab(to);
         }
     }
+
+    /// A text field of the side panel or a shell: Escape there isn't for the find bar.
+    fn is_other_field(&self, id: egui::Id) -> bool {
+        SearchView::owns(id) || self.terminals.iter().any(|t| t.id == id)
+    }
+}
+
+/// Ctrl+` toggles the terminal panel and Ctrl+Shift+` opens a new terminal, as in VS Code. The
+/// key left of 1 also does, whatever it types, and so does Ñ, VS Code's key for it on Spanish
+/// keyboards (it arrives as the key at the same place on an English one, `;`).
+fn terminal_keys(ctx: &egui::Context) -> (bool, bool) {
+    let mut found = (false, false);
+    ctx.input_mut(|i| {
+        i.events.retain(|e| match e {
+            Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.command
+                && !modifiers.alt
+                && (*key == Key::Backtick
+                    || *physical_key == Some(Key::Backtick)
+                    || *key == Key::Semicolon) =>
+            {
+                if modifiers.shift {
+                    found.0 = true;
+                } else {
+                    found.1 = true;
+                }
+                false
+            }
+            _ => true,
+        });
+    });
+    found
 }
 
 impl eframe::App for App {
@@ -835,19 +1210,50 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(t.activity_bar))
             .show(ui, |ui| self.activity_bar(ui));
         if self.side_open {
-            // Not "side": egui remembers a panel's width by its id, and the old default was 260.
-            let action = egui::Panel::left("explorer")
+            // egui remembers a panel's width by its id; this one's started at 260 before "side".
+            let panel = egui::Panel::left("explorer")
                 .resizable(true)
                 .default_size(520.0)
                 .size_range(160.0..=900.0)
-                .frame(egui::Frame::new().fill(t.sidebar))
-                .show(ui, |ui| self.explorer.ui(ui, &self.file_icons))
-                .inner;
-            match action {
-                Some(explorer::Action::Open(path)) => self.open_file(&path),
-                Some(explorer::Action::OpenFolder) => self.pick_folder(),
-                None => {}
+                .frame(egui::Frame::new().fill(t.sidebar));
+            match self.side_view {
+                SideView::Explorer => {
+                    let action = panel
+                        .show(ui, |ui| self.explorer.ui(ui, &self.file_icons))
+                        .inner;
+                    match action {
+                        Some(explorer::Action::Open(path)) => self.open_file(&path),
+                        Some(explorer::Action::OpenFolder) => self.pick_folder(),
+                        None => {}
+                    }
+                }
+                SideView::Search => {
+                    let root = self.explorer.root.clone();
+                    let action = panel
+                        .show(ui, |ui| {
+                            self.search.ui(ui, root.as_deref(), &self.file_icons)
+                        })
+                        .inner;
+                    match action {
+                        Some(search::Action::Open { path, line, cols }) => {
+                            self.open_file(&path);
+                            if let Some(doc) = self.active_doc_mut() {
+                                doc.select_in_line(line, cols);
+                            }
+                        }
+                        Some(search::Action::Replace(files)) => self.confirm_replace = Some(files),
+                        None => {}
+                    }
+                }
             }
+        }
+        if self.terminal_open {
+            egui::Panel::bottom("terminal")
+                .resizable(true)
+                .default_size(260.0)
+                .size_range(90.0..=900.0)
+                .frame(egui::Frame::new().fill(t.editor))
+                .show(ui, |ui| self.terminal_panel(ui));
         }
 
         let vscode = self.vscode.clone();
@@ -856,15 +1262,20 @@ impl eframe::App for App {
             None => highlight::default_theme(t.dark()),
         };
         let font_size = self.settings.editor_font;
+        let mut note = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.editor))
             .show(ui, |ui| match self.tabs.get_mut(self.active) {
-                Some(Tab::Doc(doc)) => doc.ui(ui, font_size, syntax_theme),
+                Some(Tab::Doc(doc)) => note = doc.ui(ui, font_size, syntax_theme, &mut self.find),
                 Some(Tab::Settings) => self.settings_page(ui),
                 None => self.welcome(ui),
             });
+        if let Some(note) = note {
+            self.show_note(note, false);
+        }
 
         self.closing_ui(&ctx);
+        self.confirm_replace_ui(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -883,6 +1294,9 @@ impl eframe::App for App {
             theme: self.theme,
             settings: self.settings.clone(),
             side_hidden: !self.side_open,
+            side_view: self.side_view,
+            search: self.search.persisted(),
+            find: self.find.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &saved);
     }

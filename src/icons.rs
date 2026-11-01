@@ -16,11 +16,16 @@ macro_rules! icons {
 }
 
 const SOURCES: &[(&str, &str)] = icons![
+    "arrow-down",
+    "arrow-up",
     "book-open",
+    "case-sensitive",
     "chevron-down",
     "chevron-right",
+    "chevron-up",
     "chevrons-down-up",
     "code",
+    "ellipsis",
     "file",
     "file-code",
     "file-text",
@@ -29,11 +34,18 @@ const SOURCES: &[(&str, &str)] = icons![
     "folder-open",
     "folder-plus",
     "image",
+    "list-x",
     "palette",
+    "plus",
     "refresh-cw",
+    "regex",
+    "replace",
+    "replace-all",
     "save",
     "search",
     "settings",
+    "square-terminal",
+    "whole-word",
     "x",
 ];
 
