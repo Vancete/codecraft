@@ -5,6 +5,7 @@ A small, fast-starting code editor written in Rust with [egui](https://github.co
 ## Features
 
 - **VS Code-like layout**: an activity bar on the left (Explorer, Search, Extensions, and at the bottom Terminal and Settings), a file tree of the open folder, editor tabs along the top and a status bar. Settings opens as a tab of its own.
+- **Explorer menu**: right-click a file, a folder or the empty space for New File, New Folder, Reveal in File Explorer (Finder), Cut, Copy, Paste, Copy Path, Copy Relative Path, Rename and Delete. New names and renames are typed in the tree, as in VS Code; Delete sends to the Recycle Bin (trash) after asking, and open tabs follow renamed or moved files.
 - **Find in the file** (Ctrl+F, Ctrl+H to replace): VS Code's find bar over the editor, with match case, whole word and regular expression (Alt+C, Alt+W, Alt+R), "3 of 12", Enter / Shift+Enter (or F3 / Shift+F3) to move between matches, and replace one or all. Regular expression replacements can use `$1`.
 - **Search in the folder** (Ctrl+Shift+F, Ctrl+Shift+H to replace): the side panel's Search view, with the same options, files to include and exclude (globs such as `*.rs, src/**`), and the matches grouped by file; a click opens the file at the match. The folder is searched in the background, skipping what `.gitignore` lists. Replace All asks first, then changes the files (open ones in the editor).
 - **Terminal** (Ctrl+`): gitcraft's built-in terminal in a panel under the editor, one tab per shell, started in the open folder. The shell is chosen in the settings.
@@ -21,6 +22,7 @@ A small, fast-starting code editor written in Rust with [egui](https://github.co
 
   and its script, which sees a `codecraft` table: `codecraft.command(id, title, run)` adds a command, `run(doc)` gets the open file as `{ text, name, path }` and returns its new text (or nothing to leave it); `codecraft.notify(message)` shows a note. Extensions start **disabled**: nothing runs until you enable it in the Extensions view. Scripts run sandboxed: no files, network or processes, no `require`, read-only globals, and a command is stopped after 3 seconds. The example `extensions/tabify` (copied next to the executable when building) adds *Tabify: Format Document with Tabs*.
 - **Opening files**: drop files or folders on the window to open them. A file opened from the system's file manager (or `codecraft <file>`) while CodeCraft is running opens in a tab of that window instead of a second one.
+- **Updates**: checks GitHub every 12 hours for a newer release and shows a pill to download it (can be turned off in the settings).
 - **Session**: the open folder, the open files, the expanded folders and the settings are restored on the next start.
 
 ## Download

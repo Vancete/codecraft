@@ -21,6 +21,7 @@ use crate::search::{self, SearchView};
 use crate::settings::{CodeTheme, Settings};
 use crate::terminal::{self, ShellSpec, Terminal};
 use crate::theme::{self, ThemeKind, Tokens};
+use crate::update;
 use crate::vscode;
 
 const MAX_RECENT: usize = 12;
@@ -56,6 +57,10 @@ struct Saved {
     side_view: SideView,
     search: SearchView,
     find: FindBar,
+    /// When GitHub was last asked for a newer release (Unix seconds).
+    update_checked: i64,
+    /// A release the user chose to skip.
+    skipped_version: String,
 }
 
 /// What the side panel shows.
@@ -149,6 +154,11 @@ pub struct App {
     extensions: Extensions,
     /// Files other instances were asked to open (see `single_instance`).
     incoming: Option<std::sync::mpsc::Receiver<PathBuf>>,
+    /// A newer release, shown as a pill in the tab strip.
+    update: Option<update::Release>,
+    update_rx: Option<std::sync::mpsc::Receiver<Result<update::Release, String>>>,
+    update_checked: i64,
+    skipped_version: String,
     /// VS Code's themes, when the setting is on.
     /// The VS Code colour theme in use, when one is chosen and found.
     code_theme: Option<Arc<vscode::theme::EditorTheme>>,
@@ -193,6 +203,10 @@ impl App {
             quick_open: QuickOpen::default(),
             extensions,
             incoming: None,
+            update: None,
+            update_rx: None,
+            update_checked: saved.update_checked,
+            skipped_version: saved.skipped_version,
             code_theme: None,
             file_icons: FileIcons,
             note: None,
@@ -202,6 +216,7 @@ impl App {
         };
         theme::install_fonts(ctx);
         app.apply_theme(ctx);
+        app.check_for_update(ctx);
 
         if let Some(folder) = saved.folder.filter(|f| f.is_dir()) {
             app.explorer.set_root(Some(folder));
@@ -411,11 +426,66 @@ impl App {
             extensions::Action::Rescan => self.extensions.rescan(enabled),
             extensions::Action::OpenFolder => {
                 let dir = Extensions::dir();
-                let opened = std::fs::create_dir_all(&dir).and_then(|()| reveal(&dir));
+                let opened = std::fs::create_dir_all(&dir).and_then(|()| open::that_detached(&dir));
                 if let Err(e) = opened {
                     self.show_note(format!("{}: {e}", dir.display()), true);
                 }
             }
+        }
+    }
+
+    /// Asks GitHub for the latest release in the background, when that's on and it's been 12
+    /// hours since the last time.
+    fn check_for_update(&mut self, ctx: &egui::Context) {
+        if !self.settings.check_updates || now() - self.update_checked <= update::INTERVAL {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::latest());
+            ctx.request_repaint();
+        });
+        self.update_rx = Some(rx);
+    }
+
+    fn poll_update(&mut self) {
+        let Some(rx) = &self.update_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.update_rx = None;
+        // A failed check (offline…) is tried again next start.
+        if let Ok(release) = result {
+            self.update_checked = now();
+            if update::newer(&release.version, update::CURRENT)
+                && release.version != self.skipped_version
+            {
+                self.update = Some(release);
+            }
+        }
+    }
+
+    /// Files under `from` were renamed or moved to `to`: their tabs follow.
+    fn moved(&mut self, from: &Path, to: &Path) {
+        for doc in self.tabs.iter_mut().filter_map(Tab::doc_mut) {
+            if let Ok(rest) = doc.path.strip_prefix(from) {
+                let path = if rest.as_os_str().is_empty() {
+                    to.to_owned()
+                } else {
+                    to.join(rest)
+                };
+                doc.moved_to(path);
+            }
+        }
+        self.explorer.selected = self.active_path();
+    }
+
+    /// Files under `path` were deleted: their tabs close, unless they hold unsaved changes.
+    fn deleted(&mut self, path: &Path) {
+        while let Some(i) = self.tabs.iter().position(|t| {
+            t.doc()
+                .is_some_and(|d| d.path.starts_with(path) && !d.dirty)
+        }) {
+            self.remove_tab(i);
         }
     }
 
@@ -977,6 +1047,49 @@ impl App {
                 if icons::bar_button(ui, "folder-open", "Open Folder (Ctrl+O)").clicked() {
                     self.pick_folder();
                 }
+                // A newer release: first in the row, before the icons.
+                if let Some(release) = self.update.clone() {
+                    ui.add_space(4.0);
+                    let pill = ui.add(
+                        egui::Button::new(
+                            RichText::new(format!("v{} available", release.version))
+                                .color(t.accent_text)
+                                .font(theme::medium(11.5)),
+                        )
+                        .fill(t.accent)
+                        .corner_radius(10.0),
+                    );
+                    egui::Popup::menu(&pill)
+                        .style(theme::menu_style)
+                        .show(|ui| {
+                            // Menus have no side margin (their buttons pad themselves); the
+                            // text gets the buttons' own.
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin {
+                                    left: 16,
+                                    right: 16,
+                                    top: 4,
+                                    bottom: 8,
+                                })
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "CodeCraft {} is out (you have {}).",
+                                            release.version,
+                                            update::CURRENT
+                                        ))
+                                        .color(t.text_dim),
+                                    );
+                                });
+                            if ui.button("Open the release page").clicked() {
+                                let _ = open::that_detached(&release.url);
+                            }
+                            if ui.button("Skip this version").clicked() {
+                                self.skipped_version = release.version.clone();
+                                self.update = None;
+                            }
+                        });
+                }
             });
         });
         if let Some(i) = select {
@@ -1413,19 +1526,12 @@ impl App {
     }
 }
 
-/// Shows a folder in the system's file manager.
-fn reveal(dir: &Path) -> std::io::Result<()> {
-    let program = if cfg!(windows) {
-        "explorer"
-    } else if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    std::process::Command::new(program)
-        .arg(dir)
-        .spawn()
-        .map(|_| ())
+/// Unix seconds.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Ctrl+` toggles the terminal panel and Ctrl+Shift+` opens a new terminal, as in VS Code. The
@@ -1496,6 +1602,7 @@ impl eframe::App for App {
 
         self.shortcuts(&ctx);
         self.open_arriving(&ctx);
+        self.poll_update();
         let t = Tokens::get(&ctx);
 
         egui::Panel::bottom("status")
@@ -1524,6 +1631,14 @@ impl eframe::App for App {
                         Some(explorer::Action::Preview(path)) => self.open_file_as(&path, true),
                         Some(explorer::Action::Open(path)) => self.open_file(&path),
                         Some(explorer::Action::OpenFolder) => self.pick_folder(),
+                        Some(explorer::Action::Created(path)) => {
+                            if path.is_file() {
+                                self.open_file(&path);
+                            }
+                        }
+                        Some(explorer::Action::Moved { from, to }) => self.moved(&from, &to),
+                        Some(explorer::Action::Deleted(path)) => self.deleted(&path),
+                        Some(explorer::Action::Error(e)) => self.show_note(e, true),
                         None => {}
                     }
                 }
@@ -1636,6 +1751,8 @@ impl eframe::App for App {
             side_view: self.side_view,
             search: self.search.persisted(),
             find: self.find.clone(),
+            update_checked: self.update_checked,
+            skipped_version: self.skipped_version.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &saved);
     }

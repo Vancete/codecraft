@@ -29,6 +29,8 @@ pub struct Settings {
     pub imported_themes: Vec<vscode::ThemeInfo>,
     /// The extensions the user enabled, by folder name; any other stays off.
     pub enabled_extensions: Vec<String>,
+    /// Ask GitHub every 12 hours whether a newer release exists.
+    pub check_updates: bool,
     /// A file opened with a single click takes the preview tab instead of a new one.
     pub preview_tabs: bool,
     /// Program of the terminal's shell; empty = the platform's default.
@@ -45,6 +47,7 @@ impl Default for Settings {
             imported_themes: Vec::new(),
             enabled_extensions: Vec::new(),
             preview_tabs: true,
+            check_updates: true,
             shell: String::new(),
             terminal_font: 13.0,
         }
@@ -104,6 +107,12 @@ impl Settings {
                         .trailing_fill(true)
                         .step_by(0.05)
                         .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+                );
+                ui.end_row();
+                ui.label("Updates");
+                ui.checkbox(
+                    &mut self.check_updates,
+                    "Check GitHub for a new version every 12 hours",
                 );
                 ui.end_row();
             });

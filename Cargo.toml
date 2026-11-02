@@ -1,6 +1,6 @@
 [package]
 name = "codecraft"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -18,6 +18,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ignore = "0.4"
 # Extensions' scripts, in Luau (sandboxed: no files, no network, no processes).
 mlua = { version = "0.12.2", features = ["luau"] }
+# Opens web pages and folders with the system's default program.
+open = "5"
 # The terminal panel: the shell in a pseudo-terminal, its output interpreted as xterm does.
 portable-pty = "0.9"
 regex = "1"
@@ -25,6 +27,10 @@ rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# The explorer's Delete: to the Recycle Bin / trash, not gone for good.
+trash = "5"
+# Asks GitHub for the latest release.
+ureq = "2"
 vt100 = "0.18"
 
 [lints.rust]
@@ -43,7 +49,7 @@ opt-level = 3
 lto = "thin"
 
 [package.metadata.deb]
-maintainer = "Iván <vancete07@gmail.com>"
+maintainer = "IvÃ¡n <vancete07@gmail.com>"
 section = "editors"
 depends = "$auto"
 extended-description = "A small, fast-starting code editor: file tree, tabs, syntax colouring, find and replace, folder search, quick open, a built-in terminal and Luau extensions."

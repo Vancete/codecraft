@@ -207,6 +207,17 @@ impl Document {
         n
     }
 
+    /// The file was renamed or moved to `path`: its name, and its colouring by the new name.
+    pub fn moved_to(&mut self, path: PathBuf) {
+        self.name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let first_line = self.text().and_then(|t| t.lines().next()).unwrap_or("");
+        self.syntax = highlight::syntax_for(&self.name, first_line);
+        self.path = path;
+    }
+
     /// The text, when it can be edited here.
     pub fn text(&self) -> Option<&str> {
         match &self.content {
