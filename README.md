@@ -1,3 +1,6 @@
+<p align="center"><img src="assets/app-icon/codecraft-256.png" width="128" alt="CodeCraft"></p>
+<p align="center"><a href="https://buymeacoffee.com/vancete"><img src="https://raw.githubusercontent.com/pachadotdev/buymeacoffee-badges/main/bmc-yellow.svg" alt="Buy Me a Coffee"></a></p>
+
 # CodeCraft
 
 A small, fast-starting code editor written in Rust with [egui](https://github.com/emilk/egui). It is a sibling of [gitcraft](https://github.com/Vancete/gitcraft) and shares its look: the same dark theme, tab strip, menus and Lucide icons.
